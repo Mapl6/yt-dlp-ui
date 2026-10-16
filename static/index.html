@@ -62,6 +62,25 @@
     </div>
   </section>
 
+  <section class="card dash" id="dash">
+    <div class="dash-head">
+      <h2>Activity</h2>
+      <span class="muted" id="dash-note"></span>
+    </div>
+    <div class="dash-stats">
+      <div><span>Downloading</span><b id="dash-active">0</b><small id="dash-active-sub"></small></div>
+      <div><span>In queue</span><b id="dash-queued">0</b><small id="dash-queued-sub"></small></div>
+      <div><span>Total speed</span><b id="dash-speed">—</b><small id="dash-speed-sub"></small></div>
+      <div><span>Last 24 hours</span><b id="dash-done">0</b><small id="dash-done-sub"></small></div>
+    </div>
+    <div class="tabs dash-tabs" id="dash-tabs">
+      <button data-dash="active">Downloading now <span class="cnt"></span></button>
+      <button data-dash="queue">Up next <span class="cnt"></span></button>
+      <button data-dash="recent">Recently finished <span class="cnt"></span></button>
+    </div>
+    <div class="dash-list" id="dash-list"></div>
+  </section>
+
   <section>
     <div class="section-head">
       <h2>Your playlists</h2>

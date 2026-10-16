@@ -191,6 +191,34 @@ check("re-merge: recovered without failing", mit["status"] == "done", (mit["stat
 check("re-merge: logged", any("merging again" in l for l in mgr.item_log(mjob["id"], "mergevid")["lines"]))
 check("re-merge: streams downloaded once, not twice", downloads_first == 2, downloads_first)
 
+# thumbnail + metadata: the cover goes inside the video file, no image left next to it; playlist name and number tagged
+os.remove(mit["filepath"]); mgr._archive_remove(str(mout), key(mit))
+ff("-f", "lavfi", "-i", "testsrc=size=320x180", "-frames:v", "1", str(media / "thumb.png"))
+plain_info = fake_info
+fake_info = lambda url: plain_info(url) | {"thumbnails": [{"url": f"http://127.0.0.1:{port}/thumb.png", "id": "0"}],
+                                           "uploader": "Tester", "description": "About the video"}
+with mgr.cond:
+    mjob.update(kind="playlist", title="My List"); mit["number"] = "07"
+OPTS.update(thumbnail=True, metadata=True)
+run_download()
+check("cover: downloaded and verified", mit["status"] == "done", (mit["status"], mit["error"]))
+check("cover: picture embedded in the video", M._has_cover(mit["filepath"]))
+left = [p.name for p in M._files_for(str(mout), "mergevid") if M.SIDECAR.search(p.name)]
+check("cover: no separate thumbnail file left", not left, left)
+tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", mit["filepath"]],
+                      capture_output=True, text=True).stdout
+check("metadata: title, artist, description, album and track written",
+      all(s in tags for s in ('"Merge test"', '"Tester"', "About the video", '"My List"', '"track": "7"')), tags)
+(mout / "Merge test [mergevid].webp").write_bytes(b"x" * 100)    # left by an older version of the app
+check("cleanup: thumbnail of a video that has the cover inside is a leftover",
+      mgr.cleanup(mjob["id"], dry_run=True)["names"] == ["Merge test [mergevid].webp"])
+check("cover: a file without a cover is detected", not M._has_cover(str(media / "full.mp4")))
+fake_info = plain_info
+with mgr.cond:
+    mjob.update(kind="video", title="Merge"); mit["number"] = ""
+OPTS.update(thumbnail=False, metadata=False)
+(mout / "Merge test [mergevid].webp").unlink()
+
 # wrong stream size: YouTube says the audio is bigger than what arrived -> streams discarded, retried
 os.remove(mit["filepath"]); mgr._archive_remove(str(mout), key(mit))
 audio_size["v"] += 1000

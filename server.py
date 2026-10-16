@@ -91,6 +91,11 @@ def overview():
     return manager.overview() | {"net": net.snapshot()}
 
 
+@app.get("/api/activity")
+def activity():
+    return manager.activity()
+
+
 @app.post("/api/net/check")
 def net_check():
     net.check_now()

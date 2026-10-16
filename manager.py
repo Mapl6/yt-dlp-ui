@@ -26,6 +26,7 @@ except ImportError:                                # Windows: locks are skipped
 
 import yt_dlp
 from yt_dlp.networking.exceptions import HTTPError, TransportError
+from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import ContentTooShortError, DownloadCancelled, ExtractorError, GeoRestrictedError
 
 DATA_DIR = Path(os.environ.get("YTDL_DATA_DIR") or Path(__file__).parent / "data")
@@ -83,6 +84,7 @@ FINAL_FILE = re.compile(r"\[([^\[\]]+)\]\.(?:%s)$" % "|".join(MEDIA_EXTS), re.I)
 ID_TAG = re.compile(r"\[([^\[\]]+)\]")
 LEFTOVER = re.compile(r"\.(?:part|ytdl|damaged)$|\.part-Frag\d+|\.temp\.\w+$", re.I)
 SIDECAR = re.compile(r"\.(?:jpe?g|webp|png|vtt|srt|ass|lrc)$", re.I)
+IMAGE_EXT = re.compile(r"\.(?:jpe?g|webp|png)$", re.I)
 CHECK_WORKERS = 3        # files verified in parallel by "Check files"
 
 # Placeholder titles YouTube uses for entries that can't be watched any more.
@@ -254,6 +256,29 @@ def _verify_file(path: str | None, duration: float | None) -> str | None:
         if tail.returncode == 0 and not any(line and not line.startswith("#") for line in tail.stdout.splitlines()):
             return "The end of the file is missing"
     return None
+
+
+def _has_cover(path: str) -> bool:
+    """True if the file carries an embedded cover picture (so the separate thumbnail file isn't needed)."""
+    try:
+        res = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+                              "stream=codec_name:stream_disposition=attached_pic", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return any(line.rstrip().endswith(",1") for line in res.stdout.splitlines())
+
+
+class _PlaylistTags(PostProcessor):
+    """Adds the playlist name (album) and the video's number (track) to the file's metadata."""
+
+    def __init__(self, tags: dict):
+        super().__init__()
+        self.tags = {f"meta_{k}": v for k, v in tags.items() if v}
+
+    def run(self, info):
+        info.update(self.tags)
+        return [], info
 
 
 class _FileLock:
@@ -1110,14 +1135,23 @@ class Manager:
                 names = os.listdir(outdir)
             except OSError:
                 continue
+            media: dict[str, str] = {}                 # video id -> its finished file
+            owned = []
             for name in names:
                 tags = ID_TAG.findall(name)
                 vid = next((t for t in reversed(tags) if t in statuses), None)
                 if vid is None:
                     continue
-                downloaded = statuses[vid] in ("done", "skipped")
                 is_part = re.search(re.escape(f"[{vid}]") + r"\.f[\w-]+\.\w+$", name)
-                if LEFTOVER.search(name) or is_part or (SIDECAR.search(name) and not downloaded):
+                owned.append((name, vid, is_part))
+                if not (is_part or LEFTOVER.search(name) or SIDECAR.search(name)):
+                    media[vid] = os.path.join(outdir, name)
+            for name, vid, is_part in owned:
+                downloaded = statuses[vid] in ("done", "skipped")
+                # A downloaded video's thumbnail is a leftover only once the picture is inside the video file.
+                stray = SIDECAR.search(name) and (not downloaded or IMAGE_EXT.search(name) and vid in media
+                                                  and _has_cover(media[vid]))
+                if LEFTOVER.search(name) or is_part or stray:
                     path = os.path.join(outdir, name)
                     if os.path.isfile(path):
                         files.append(path)
@@ -1269,6 +1303,55 @@ class Manager:
             "settings": self.settings,
         }
 
+    def activity(self) -> dict:
+        """Everything in flight across all playlists, for the dashboard: what is downloading, what is
+        queued (in the order the scheduler will pick it) and what finished recently."""
+        now = time.time()
+        with self.cond:
+            reason = self.waiting_reason()
+            limit = self._limit()
+
+            def row(job, it, **extra):
+                return {"job": job["id"], "job_title": job["title"], "id": it["id"], "title": it["title"],
+                        "url": it.get("url"), "index": it.get("index"), "duration": it.get("duration"),
+                        "status": it["status"], "error": it.get("error"), **extra}
+
+            active, queue, recent = [], [], []
+            for job in sorted(self.jobs.values(), key=lambda j: j["created"]):   # scheduler order
+                for it in job["items"]:
+                    st = it["status"]
+                    if st in ACTIVE:
+                        active.append(row(job, it, progress=it.get("progress") or 0, speed=it.get("speed"),
+                                          eta=it.get("eta"), downloaded=it.get("downloaded"), total=it.get("total"),
+                                          started=it.get("started"),
+                                          attempts=(it.get("attempts") or 0) + (it.get("net_attempts") or 0)))
+                    elif st == "queued":
+                        if job["paused"]:
+                            wait = "Playlist paused"
+                        elif it.get("next_try", 0) > now:
+                            wait = f"Retry in {_fmt_secs(it['next_try'] - now)}"
+                        else:
+                            wait = reason or "Waiting for a free slot"
+                        queue.append(row(job, it, wait=wait, progress=it.get("progress") or 0,
+                                         retrying=it.get("next_try", 0) > now or bool(job["paused"])))
+                    elif st in ("done", "failed") and it.get("finished"):
+                        recent.append(row(job, it, finished=it["finished"], filepath=it.get("filepath")))
+            recent.sort(key=lambda r: -r["finished"])
+            day = [r for r in recent if now - r["finished"] < 86400]
+            return {
+                "active": active,
+                "queue": queue[:200], "queued": len(queue),
+                "recent": recent[:30],
+                "stats": {
+                    "active": len(active), "limit": limit, "concurrency": self.settings["concurrency"],
+                    "queued": len(queue), "ready": sum(not q["retrying"] for q in queue),
+                    "speed": sum(a["speed"] or 0 for a in active),
+                    "done_today": sum(r["status"] == "done" for r in day),
+                    "failed_today": sum(r["status"] == "failed" for r in day),
+                    "waiting": reason,
+                },
+            }
+
     # ---- workers
 
     def _flight_key(self, job: dict, item: dict) -> tuple[str, str]:
@@ -1307,14 +1390,14 @@ class Manager:
                 self.inflight.add(key)
                 if self.settings.get("sleep_between"):
                     self.next_start = time.time() + float(self.settings["sleep_between"])
-                item.update(status="downloading", speed=None, eta=None)
+                item.update(status="downloading", speed=None, eta=None, started=time.time())
                 self.active += 1
                 self._touch(job, item)
             try:
                 self._download(job, item)
             except Exception as exc:  # never let a worker die
                 log.exception("Unexpected error downloading %s", item["id"])
-                self._set(job, item, status="failed", error=_clean_error(exc))
+                self._set(job, item, status="failed", error=_clean_error(exc), finished=time.time())
             finally:
                 with self.cond:
                     self.active -= 1
@@ -1416,6 +1499,9 @@ class Manager:
         try:
             for attempt in (1, 2):
                 with yt_dlp.YoutubeDL(opts) as ydl:
+                    if options.get("metadata", True) and job["kind"] == "playlist":
+                        ydl.add_post_processor(_PlaylistTags({"album": job["title"], "track": item["number"].lstrip("0")}),
+                                               when="pre_process")
                     info = ydl.extract_info(item["url"], download=True) or {}
                 filepath = ((info.get("requested_downloads") or [{}])[0].get("filepath")) or info.get("filepath")
                 parts = _part_files(outdir, item["id"])
@@ -1435,11 +1521,16 @@ class Manager:
                 _remove(parts.values())
                 raise _IncompleteFile(problem)
             _remove(parts.values())                       # merged file verified: the streams aren't needed
+            # keepvideo also stops yt-dlp deleting the thumbnail and subtitle files it embedded: remove them
+            # here, but keep the thumbnail if the container couldn't take it (e.g. webm).
+            sidecars = [p for p in _files_for(outdir, item["id"]) if SIDECAR.search(p.name) and str(p) != filepath]
+            embedded_cover = options.get("thumbnail", True) and _has_cover(filepath)
+            _remove(p for p in sidecars if (embedded_cover if IMAGE_EXT.search(p.name) else options.get("subtitles")))
             _remove(p for p in _files_for(outdir, item["id"]) if p.name.endswith(".damaged"))
             # The archive is written only now, after the file is verified, so a broken file is never "done".
             if skip_existing:
                 self._archive_add(outdir, archive_key)
-            self._set(job, item, status="done", progress=100.0, filepath=filepath, error=None,
+            self._set(job, item, status="done", progress=100.0, filepath=filepath, error=None, finished=time.time(),
                       attempts=0, net_attempts=0, health="ok", checked=time.time(), file_problem=None)
             self._item_log(job, item, "info", f"Done and verified: {os.path.basename(filepath)}")
             with self.cond:
@@ -1492,6 +1583,8 @@ class Manager:
                     item.update(status="queued", error=f"Retrying in {backoff}s — {msg}", next_try=now + backoff)
                 else:
                     item.update(status="failed", error=msg)
+            if item["status"] == "failed":
+                item["finished"] = now
             self._touch(job, item)
         self._item_log(job, item, "error", f"{kind} error → {item['status']}: {msg}")
         if kind == "network":

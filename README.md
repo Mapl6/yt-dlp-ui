@@ -26,9 +26,9 @@ Requires Python 3.10+, `ffmpeg` (`brew install ffmpeg`), and a JS runtime — de
 - Half-finished downloads continue where they stopped, even after a restart
 - Videos already in the folder (from its `.downloaded.txt` archive) are marked as downloaded automatically
 - **Automatic retries** with backoff for network errors; private or deleted videos fail right away with a clear reason
-- Embeds the thumbnail, metadata, chapters, and (optionally) English subtitles
+- Embeds the thumbnail (as the cover inside the video file, with no separate image left next to it), metadata (title, channel, date, description, link, and for playlists the playlist name as album and the video number as track), chapters, and (optionally) English subtitles
 - **Check files** (inside an opened playlist) verifies every downloaded video, including ones downloaded long ago. Damaged files are renamed to `….damaged` and missing ones are flagged; both go to the *Failed* tab, where *Retry* downloads them again. Good files already in the folder that the app didn't know about are marked as downloaded.
-- **Clean up leftovers** deletes partial downloads, unmerged streams and `….damaged` files of a playlist, after showing you the list. Videos in the queue are never touched.
+- **Clean up leftovers** deletes partial downloads, unmerged streams, `….damaged` files and thumbnail images whose picture is already inside the video, of a playlist, after showing you the list. Videos in the queue are never touched.
 - **Details** button on any video with a problem shows what happened; the full log is in `data/app.log`
 
 ## Connection panel
@@ -44,6 +44,17 @@ Every 10 seconds the app checks the internet (Google) and YouTube (through your 
 | Offline | No internet (or the proxy isn't running) |
 
 It also shows response times, stability, live download speed, and a chart of recent YouTube response times. Press **Test now** to check right away; saving Settings re-checks automatically.
+
+## Activity dashboard
+
+The **Activity** panel shows every playlist at once:
+
+- **Totals:** how many videos are downloading (and the current limit, which drops on a weak connection), how many are queued (ready vs. waiting for a retry or a paused playlist), total speed with the data left in the current videos, and how many finished or failed in the last 24 hours.
+- **Downloading now:** each video's playlist, progress, size, speed, time left, when it started and which attempt this is. ✕ stops it.
+- **Up next:** the queue in the order videos will start, with why each one is waiting ("Waiting for a free slot", "Retry in 0:40", "Playlist paused", offline…) and its last error. ✕ removes it from the queue.
+- **Recently finished:** the last 30 videos that were downloaded or failed, with the file name or error. Failed ones can be retried here.
+
+Video titles link to YouTube. Playlist names jump to that playlist below.
 
 ## Settings (⚙)
 

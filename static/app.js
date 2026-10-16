@@ -418,7 +418,7 @@ async function onClick(e, view) {
     if (role === "apply-range") return selectRange(view, $('[data-role="range"]', view.body).value);
     if (role === "download") { btn.disabled = true; await startDownload(view); return poll(); }
 
-    if (btn.dataset.log) return showLog(view, btn.dataset.log);
+    if (btn.dataset.log) return showLog(view.id, btn.dataset.log);
     if (btn.dataset.item) {
       await api(`/api/jobs/${view.id}/items/${encodeURIComponent(btn.dataset.id)}/${btn.dataset.item}`, { method: "POST" });
       return poll();
@@ -448,8 +448,8 @@ function toggleOpen(view) {
   return poll();
 }
 
-async function showLog(view, itemId) {
-  const data = await api(`/api/jobs/${view.id}/items/${encodeURIComponent(itemId)}/log`);
+async function showLog(jobId, itemId) {
+  const data = await api(`/api/jobs/${jobId}/items/${encodeURIComponent(itemId)}/log`);
   $("#log-title").textContent = data.title;
   $("#log-error").textContent = data.error || "";
   $("#log-error").classList.toggle("hidden", !data.error);
@@ -535,6 +535,154 @@ async function testNow() {
 $("#btn-net-check").addEventListener("click", testNow);
 $("#net-pill").addEventListener("click", () => $("#net-card").scrollIntoView({ behavior: "smooth", block: "center" }));
 
+/* ------------------------------------------------------------ activity dashboard */
+
+const fmtAgo = (ts) => {
+  if (!ts) return "";
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(ts * 1000).toLocaleDateString();
+};
+const DASH_EMPTY = {
+  active: "Nothing is downloading right now.",
+  queue: "The queue is empty. Open a playlist below, select videos and press Download.",
+  recent: "No downloads have finished yet.",
+};
+
+let dashTab = (() => { try { return localStorage.getItem("dashTab") || "active"; } catch { return "active"; } })();
+const dashRows = new Map(); // key -> { el, html }
+let dashData = null;
+
+function dashRowHtml(tab, r, pos) {
+  const vid = r.url ? `<a href="${esc(r.url)}" target="_blank" rel="noopener" title="${esc(r.title)}">${esc(r.title)}</a>` : esc(r.title);
+  const from = `<button class="linkish" data-goto="${esc(r.job)}" title="Show this playlist">${esc(r.job_title)}</button>`;
+  const ids = `data-job="${esc(r.job)}" data-id="${esc(r.id)}"`;
+  let lead = "", meta = "", extra = "", right = "";
+  if (tab === "active") {
+    lead = `<span class="badge s-${r.status}">${ITEM_LABEL[r.status]}</span>`;
+    if (r.status === "processing") meta = "Merging and verifying the file…";
+    else {
+      const bits = [`${(r.progress || 0).toFixed(1)}%`, `${fmtBytes(r.downloaded)} / ${fmtBytes(r.total)}`, fmtSpeed(r.speed)];
+      if (r.eta != null) bits.push(`${fmtTime(r.eta)} left`);
+      meta = bits.join(" · ");
+    }
+    if (r.started) meta += ` · started ${fmtAgo(r.started)}`;
+    if (r.attempts) meta += ` · attempt ${r.attempts + 1}`;
+    extra = `<div class="bar small"><div style="width:${r.status === "processing" ? 100 : r.progress || 0}%"></div></div>`;
+    right = `<button class="small ghost" data-dact="cancel" ${ids} title="Stop this video">✕</button>`;
+  } else if (tab === "queue") {
+    lead = `<span class="pos">#${pos + 1}</span>`;
+    meta = `<span class="${r.retrying ? "s-pausing" : ""}">${esc(r.wait)}</span>`;
+    if (r.progress > 0 && r.progress < 100) meta += ` · ${r.progress.toFixed(0)}% already downloaded`;
+    if (r.duration) meta += ` · ${fmtTime(r.duration)}`;
+    right = (r.error ? `<button class="small ghost" data-dact="log" ${ids}>Details</button>` : "") +
+      `<button class="small ghost" data-dact="cancel" ${ids} title="Remove from queue">✕</button>`;
+  } else {
+    lead = `<span class="badge s-${r.status}">${ITEM_LABEL[r.status]}</span>`;
+    meta = fmtAgo(r.finished);
+    if (r.status === "done" && r.filepath) meta += ` · ${esc(r.filepath.split(/[\\/]/).pop())}`;
+    right = r.status === "failed"
+      ? `<button class="small ghost" data-dact="log" ${ids}>Details</button><button class="small" data-dact="retry" ${ids}>Retry</button>`
+      : `<button class="small ghost" data-dact="log" ${ids}>Details</button>`;
+  }
+  const err = r.error && (tab !== "recent" || r.status === "failed") ? `<div class="err">${esc(r.error)}</div>` : "";
+  return `<div class="lead">${lead}</div>
+    <div class="mid"><div class="t">${vid}</div><div class="meta">${from} · ${meta}</div>${extra}${err}</div>
+    <div class="right">${right}</div>`;
+}
+
+function renderDash() {
+  const d = dashData;
+  if (!d) return;
+  const st = d.stats;
+  $("#dash-active").textContent = st.active;
+  $("#dash-active-sub").textContent = st.limit < st.concurrency ? `of ${st.limit} (reduced: weak connection)` : `of ${st.limit} at once`;
+  $("#dash-queued").textContent = st.queued;
+  $("#dash-queued-sub").textContent = st.queued ? `${st.ready} ready · ${st.queued - st.ready} waiting` : "nothing waiting";
+  $("#dash-speed").textContent = st.active ? fmtSpeed(st.speed) : "—";
+  const left = d.active.reduce((n, a) => n + (a.total && a.downloaded != null ? Math.max(0, a.total - a.downloaded) : 0), 0);
+  $("#dash-speed-sub").textContent = left ? `${fmtBytes(left)} left in current videos` : "";
+  $("#dash-done").textContent = `${st.done_today} done`;
+  $("#dash-done-sub").textContent = st.failed_today ? `${st.failed_today} failed` : "no failures";
+  $("#dash-done-sub").classList.toggle("s-failed", !!st.failed_today);
+  $("#dash-note").textContent = st.waiting ? `⏸ ${st.waiting}` : "";
+
+  const counts = { active: d.active.length, queue: d.queued, recent: d.recent.length };
+  for (const b of $$("[data-dash]")) {
+    b.classList.toggle("on", b.dataset.dash === dashTab);
+    $(".cnt", b).textContent = counts[b.dataset.dash] || "";
+  }
+
+  const list = $("#dash-list");
+  const rows = d[dashTab] || [];
+  if (!rows.length) {
+    dashRows.clear();
+    const html = `<p class="dash-empty">${DASH_EMPTY[dashTab]}</p>`;
+    if (list.innerHTML !== html) list.innerHTML = html;
+    return;
+  }
+  $(".dash-empty", list)?.remove();
+  const keep = new Set();
+  let prev = null;
+  rows.forEach((r, i) => {
+    const key = `${r.job}:${r.id}`;
+    keep.add(key);
+    let row = dashRows.get(key);
+    if (!row) {
+      row = { el: document.createElement("div"), html: "" };
+      row.el.className = "dash-row";
+      dashRows.set(key, row);
+    }
+    // Only touch rows that changed, so clicks are never lost mid-poll.
+    const html = dashRowHtml(dashTab, r, i);
+    if (row.html !== html) row.el.innerHTML = row.html = html;
+    const want = prev ? prev.nextSibling : list.firstChild;
+    if (want !== row.el) list.insertBefore(row.el, want);
+    prev = row.el;
+  });
+  for (const [key, row] of dashRows) if (!keep.has(key)) { row.el.remove(); dashRows.delete(key); }
+  const more = d.queued - d.queue.length;
+  if (dashTab === "queue" && more > 0) {
+    let foot = $(".dash-more", list) || list.appendChild(Object.assign(document.createElement("p"), { className: "dash-more" }));
+    foot.textContent = `…and ${more} more`;
+  } else $(".dash-more", list)?.remove();
+}
+
+$("#dash-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-dash]");
+  if (!b) return;
+  dashTab = b.dataset.dash;
+  try { localStorage.setItem("dashTab", dashTab); } catch {}
+  $("#dash-list").innerHTML = "";
+  dashRows.clear();
+  renderDash();
+});
+
+$("#dash-list").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button");
+  if (!btn) return;
+  try {
+    if (btn.dataset.goto) {
+      const view = jobViews.get(btn.dataset.goto);
+      if (!view) return;
+      if (!expanded.has(view.id)) await toggleOpen(view);
+      view.el.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    const { dact, job, id } = btn.dataset;
+    if (dact === "log") return showLog(job, id);
+    if (dact === "cancel" || dact === "retry") {
+      btn.disabled = true;
+      await api(`/api/jobs/${job}/items/${encodeURIComponent(id)}/${dact}`, { method: "POST" });
+      return poll();
+    }
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
 /* ------------------------------------------------------------ polling */
 
 let polling = false;
@@ -542,8 +690,10 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    const data = await api("/api/overview");
+    const [data, activity] = await Promise.all([api("/api/overview"), api("/api/activity")]);
     settings = data.settings;
+    dashData = activity;
+    renderDash();
     renderNet(data.net);
     $("#stat-active").textContent = `${data.active} downloading`;
     $("#stat-speed").textContent = data.active ? fmtSpeed(data.speed) : "—";
