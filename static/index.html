@@ -4,25 +4,36 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="api-token" content="">
+  <meta name="color-scheme" content="light dark">
   <title>YT Downloader</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e5322d'/%3E%3Cpath d='M10 12h12l-6 9z' fill='white'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23d93a32'/%3E%3Cpath d='M16 8v12m0 0-5-5m5 5 5-5M10 24h12' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="logo">▼</span> YT Downloader</div>
-  <div class="stats">
-    <span class="net-pill" id="net-pill" title="Connection"><span class="dot"></span><span id="net-pill-text">Checking…</span></span>
-    <span id="stat-active">0 downloading</span>
-    <span id="stat-speed">—</span>
-    <button class="ghost" id="btn-settings" title="Settings">⚙ Settings</button>
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 5v10m0 0-4-4m4 4 4-4M7 19h10"/></svg></span>
+      YT Downloader
+    </div>
+    <div class="stats">
+      <button class="net-pill" id="net-pill" type="button" title="Connection"><span class="dot"></span><span id="net-pill-text">Checking…</span></button>
+      <span class="stat" id="stat-active">0 downloading</span>
+      <span class="stat" id="stat-speed">—</span>
+      <button class="icon-btn" id="btn-settings" type="button" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>
+      </button>
+    </div>
   </div>
 </header>
 
 <main>
-  <section class="card">
+  <section class="hero">
+    <h1>Download from YouTube</h1>
+    <p class="lead">Save a playlist, channel or video to your library, then choose which videos to download.</p>
     <form id="open-form" class="url-row">
-      <input id="url" type="url" placeholder="Paste a YouTube playlist, channel, or video link…" required autofocus>
+      <svg class="url-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></svg>
+      <input id="url" type="url" placeholder="Paste a YouTube link…" aria-label="YouTube link" required autofocus>
       <button type="submit" class="primary" id="btn-open">Add</button>
     </form>
     <p class="hint" id="open-status">The whole playlist is saved to your library. Pick which videos to download whenever you like.</p>
@@ -53,8 +64,8 @@
 
   <section>
     <div class="section-head">
-      <h3>Your playlists</h3>
-      <input id="lib-filter" type="search" placeholder="Search playlists…">
+      <h2>Your playlists</h2>
+      <input id="lib-filter" type="search" placeholder="Search playlists" aria-label="Search playlists">
     </div>
     <div id="jobs"><p class="empty">Nothing saved yet. Paste a playlist link above.</p></div>
   </section>
@@ -63,41 +74,45 @@
 <!-- One of these is cloned into each playlist card when it is opened. -->
 <template id="tpl-body">
   <div class="job-body">
-    <div class="options">
-      <label>Quality <select data-opt="quality"></select></label>
-      <label data-video-only>Format
-        <select data-opt="container">
-          <option value="mp4">MP4 (plays everywhere)</option>
-          <option value="mkv">MKV (best quality codecs)</option>
-          <option value="webm">WebM</option>
-        </select>
-      </label>
-      <label class="grow">Save to <input data-opt="output_dir" type="text"></label>
-    </div>
-    <div class="checks">
-      <label data-playlist-only><input type="checkbox" data-opt="numbering" checked> Number files by playlist order</label>
-      <label><input type="checkbox" data-opt="thumbnail" checked> Embed thumbnail</label>
-      <label><input type="checkbox" data-opt="metadata" checked> Embed metadata &amp; chapters</label>
-      <label data-video-only><input type="checkbox" data-opt="subtitles"> Embed English subtitles</label>
+    <div class="opts-panel">
+      <div class="options">
+        <label>Quality <select data-opt="quality"></select></label>
+        <label data-video-only>Format
+          <select data-opt="container">
+            <option value="mp4">MP4 (plays everywhere)</option>
+            <option value="mkv">MKV (best quality codecs)</option>
+            <option value="webm">WebM</option>
+          </select>
+        </label>
+        <label class="grow">Save to <input data-opt="output_dir" type="text"></label>
+      </div>
+      <div class="checks">
+        <label data-playlist-only><input type="checkbox" data-opt="numbering" checked> Number files by playlist order</label>
+        <label><input type="checkbox" data-opt="thumbnail" checked> Embed thumbnail</label>
+        <label><input type="checkbox" data-opt="metadata" checked> Embed metadata &amp; chapters</label>
+        <label data-video-only><input type="checkbox" data-opt="subtitles"> Embed English subtitles</label>
+      </div>
     </div>
 
     <div class="select-bar">
       <label class="sel-all"><input type="checkbox" data-role="sel-all"> <span data-role="sel-count">0 selected</span></label>
       <button class="small" type="button" data-role="sel-missing">Select not downloaded</button>
-      <input data-role="range" type="text" placeholder="Range: 1-50, 80, 100-">
-      <button class="small" type="button" data-role="apply-range">Select range</button>
-      <input data-role="filter" type="search" placeholder="Filter titles…">
+      <div class="range-group">
+        <input data-role="range" type="text" placeholder="Range: 1-50, 80, 100-" aria-label="Range">
+        <button class="small" type="button" data-role="apply-range">Select</button>
+      </div>
+      <input data-role="filter" type="search" placeholder="Filter titles" aria-label="Filter titles">
       <button class="primary" type="button" data-role="download" disabled>Download selected</button>
-    </div>
-
-    <div class="tools">
-      <button class="small" type="button" data-role="check" title="Verify every downloaded file, and find good files already in the folder">Check files</button>
-      <button class="small" type="button" data-role="cleanup" title="Delete partial downloads and other leftovers of this playlist">Clean up leftovers</button>
-      <span class="muted" data-role="tools-status"></span>
     </div>
 
     <div class="tabs" data-role="tabs"></div>
     <div class="items" data-role="items"></div>
+
+    <div class="tools">
+      <button class="small ghost" type="button" data-role="check" title="Verify every downloaded file, and find good files already in the folder">Check files</button>
+      <button class="small ghost" type="button" data-role="cleanup" title="Delete partial downloads and other leftovers of this playlist">Clean up leftovers</button>
+      <span class="muted" data-role="tools-status"></span>
+    </div>
   </div>
 </template>
 
@@ -107,25 +122,31 @@
     <label>Default download folder <input id="set-outdir" type="text">
       <small>Each playlist gets its own folder inside this one.</small>
     </label>
-    <label>Parallel downloads <input id="set-concurrency" type="number" min="1" max="8"></label>
-    <label>Use cookies from browser
-      <select id="set-cookies">
-        <option value="">None</option>
-        <option>chrome</option><option>safari</option><option>firefox</option>
-        <option>brave</option><option>edge</option><option>chromium</option><option>opera</option><option>vivaldi</option>
-      </select>
-      <small>Needed for age-restricted / members videos, or if YouTube asks to “confirm you’re not a bot”.</small>
-    </label>
+    <div class="field-row">
+      <label>Parallel downloads <input id="set-concurrency" type="number" min="1" max="8"></label>
+      <label>Use cookies from browser
+        <select id="set-cookies">
+          <option value="">None</option>
+          <option>chrome</option><option>safari</option><option>firefox</option>
+          <option>brave</option><option>edge</option><option>chromium</option><option>opera</option><option>vivaldi</option>
+        </select>
+      </label>
+    </div>
+    <small class="field-note">Cookies are needed for age-restricted or members-only videos, or if YouTube asks you to confirm you’re not a bot.</small>
     <label>Proxy (optional) <input id="set-proxy" type="text" placeholder="socks5://127.0.0.1:1080">
       <small>Use this if YouTube is blocked on your network (VPN / proxy client address).</small>
     </label>
-    <label class="inline"><input id="set-waitnet" type="checkbox"> Wait while offline, slow down on a weak connection
-      <small>Downloads pause while the internet or YouTube is down and resume by themselves. Turn off only if the connection test is wrong for your network.</small>
+    <label class="inline"><input id="set-waitnet" type="checkbox"> <span>Wait while offline, slow down on a weak connection
+      <small>Downloads pause while the internet or YouTube is down and resume by themselves. Turn off only if the connection test is wrong for your network.</small></span>
     </label>
-    <label>Speed limit per download (MB/s, 0 = unlimited) <input id="set-rate" type="number" min="0" step="0.5"></label>
-    <label>Pause between videos (seconds) <input id="set-sleep" type="number" min="0" step="1">
-      <small>A few seconds helps avoid rate limiting on very large playlists.</small>
-    </label>
+    <div class="field-row">
+      <label>Speed limit per download (MB/s) <input id="set-rate" type="number" min="0" step="0.5">
+        <small>0 = unlimited</small>
+      </label>
+      <label>Pause between videos (s) <input id="set-sleep" type="number" min="0" step="1">
+        <small>Helps avoid rate limiting.</small>
+      </label>
+    </div>
     <div class="actions">
       <button value="cancel" class="ghost">Cancel</button>
       <button value="save" class="primary">Save</button>
@@ -143,7 +164,7 @@
   </form>
 </dialog>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast hidden" role="status"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

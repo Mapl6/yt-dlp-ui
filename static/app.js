@@ -148,8 +148,10 @@ function headButtons(j) {
   if (j.kind === "playlist") b.push(["refresh", "Check for new videos"]);
   b.push(["open", "Open folder"]);
   b.push(["remove", "Remove"]);
+  const open = expanded.has(j.id);
   return b.map(([a, l, cls = ""]) => `<button class="small ${cls}" data-act="${a}">${l}</button>`).join("") +
-    `<button class="small ghost" data-act="toggle">${expanded.has(j.id) ? "Close ▲" : "Open ▼"}</button>`;
+    `<button class="small ghost chev" data-act="toggle" aria-expanded="${open}" title="${open ? "Close" : "Open"}" aria-label="${open ? "Close" : "Open"}">` +
+    `<svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>`;
 }
 
 function renderHead(view) {
@@ -294,7 +296,7 @@ function renderItem(view, row) {
   } else if (it.status === "skipped") {
     meta = it.filepath ? esc(it.filepath.split(/[\\/]/).pop()) : "Already in the folder";
   }
-  if (it.health === "ok" && (it.status === "done" || it.status === "skipped")) meta += ` · <span class="s-done">✓ verified</span>`;
+  if (it.health === "ok" && (it.status === "done" || it.status === "skipped")) meta += `${meta ? " · " : ""}<span class="s-done">✓ verified</span>`;
   if (it.removed && !UNAVAILABLE(it)) meta += `${meta ? " · " : ""}no longer in the playlist`;
   let btn = it.error ? `<button class="small ghost" data-log="${esc(it.id)}" title="What happened">Details</button>` : "";
   if (UNAVAILABLE(it)) btn = "";
@@ -380,7 +382,11 @@ async function startDownload(view) {
 
 async function onClick(e, view) {
   const btn = e.target.closest("button");
-  if (!btn) return;
+  if (!btn) {
+    // A click anywhere on the card header (not a button, not selecting text) opens or closes it.
+    if (e.target.closest(".job-head") && !String(window.getSelection())) toggleOpen(view);
+    return;
+  }
   e.preventDefault(); // buttons inside <label> rows must not toggle the checkbox
   try {
     if (btn.dataset.tab) {
@@ -419,11 +425,7 @@ async function onClick(e, view) {
     }
 
     const act = btn.dataset.act;
-    if (act === "toggle") {
-      expanded.has(view.id) ? expanded.delete(view.id) : expanded.add(view.id);
-      saveExpanded();
-      return poll();
-    }
+    if (act === "toggle") return toggleOpen(view);
     if (act === "stop" && !confirm("Stop downloading? Videos still in the queue go back to “Not downloaded”.")) return;
     if (act === "remove" && !confirm(`Remove “${view.job.title}” from your library?\nFiles you already downloaded are kept.`)) return;
     if (act === "refresh") { btn.disabled = true; btn.textContent = "Checking…"; }
@@ -438,6 +440,12 @@ async function onClick(e, view) {
     view.btnHtml = null;
     toast(err.message);
   }
+}
+
+function toggleOpen(view) {
+  expanded.has(view.id) ? expanded.delete(view.id) : expanded.add(view.id);
+  saveExpanded();
+  return poll();
 }
 
 async function showLog(view, itemId) {
@@ -555,6 +563,7 @@ async function poll() {
       if (!view.el.parentNode) container.appendChild(view.el);
       renderHead(view);
       const open = expanded.has(j.id);
+      view.el.classList.toggle("open", open);
       if (open && !view.body) buildBody(view);
       if (view.body) {
         view.body.classList.toggle("hidden", !open);
