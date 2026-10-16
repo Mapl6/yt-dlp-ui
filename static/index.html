@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="api-token" content="">
   <title>YT Downloader</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e5322d'/%3E%3Cpath d='M10 12h12l-6 9z' fill='white'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/style.css">
@@ -26,6 +27,8 @@
     </form>
     <p class="hint" id="open-status">The whole playlist is saved to your library. Pick which videos to download whenever you like.</p>
   </section>
+
+  <div class="wait-banner hidden" id="wait-banner" role="status"></div>
 
   <section class="card net lvl-checking" id="net-card" aria-live="polite">
     <div class="net-main">
@@ -87,6 +90,12 @@
       <button class="primary" type="button" data-role="download" disabled>Download selected</button>
     </div>
 
+    <div class="tools">
+      <button class="small" type="button" data-role="check" title="Verify every downloaded file, and find good files already in the folder">Check files</button>
+      <button class="small" type="button" data-role="cleanup" title="Delete partial downloads and other leftovers of this playlist">Clean up leftovers</button>
+      <span class="muted" data-role="tools-status"></span>
+    </div>
+
     <div class="tabs" data-role="tabs"></div>
     <div class="items" data-role="items"></div>
   </div>
@@ -110,6 +119,9 @@
     <label>Proxy (optional) <input id="set-proxy" type="text" placeholder="socks5://127.0.0.1:1080">
       <small>Use this if YouTube is blocked on your network (VPN / proxy client address).</small>
     </label>
+    <label class="inline"><input id="set-waitnet" type="checkbox"> Wait while offline, slow down on a weak connection
+      <small>Downloads pause while the internet or YouTube is down and resume by themselves. Turn off only if the connection test is wrong for your network.</small>
+    </label>
     <label>Speed limit per download (MB/s, 0 = unlimited) <input id="set-rate" type="number" min="0" step="0.5"></label>
     <label>Pause between videos (seconds) <input id="set-sleep" type="number" min="0" step="1">
       <small>A few seconds helps avoid rate limiting on very large playlists.</small>
@@ -118,6 +130,16 @@
       <button value="cancel" class="ghost">Cancel</button>
       <button value="save" class="primary">Save</button>
     </div>
+  </form>
+</dialog>
+
+<dialog id="log-dialog">
+  <form method="dialog">
+    <h3 id="log-title"></h3>
+    <p class="err" id="log-error"></p>
+    <pre class="log-lines" id="log-lines"></pre>
+    <p class="muted small-note">Full log: <code>data/app.log</code> in the app folder.</p>
+    <div class="actions"><button value="close" class="primary">Close</button></div>
   </form>
 </dialog>
 

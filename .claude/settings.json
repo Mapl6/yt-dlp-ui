@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python tests/test_core.py)",
+      "Bash(.venv/bin/python tests/test_reliability.py)",
+      "Bash(.venv/bin/python tests/test_health.py)",
+      "Bash(.venv/bin/python -m py_compile:*)",
+      "Bash(node --check:*)",
+      "Bash(.venv/bin/python .claude/skills/verify-downloads/scripts/verify_folder.py:*)",
+      "Bash(.venv/bin/python .claude/skills/safe-test-server/scripts/make_safe_copy.py:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf data:*)",
+      "Bash(rm -rf ./data:*)"
+    ]
+  }
+}

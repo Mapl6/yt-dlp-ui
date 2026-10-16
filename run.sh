@@ -9,12 +9,13 @@ if [ ! -x .venv/bin/python ]; then
 fi
 
 # Keep yt-dlp current — YouTube changes often and old versions break.
+# A failed update (e.g. offline) must not stop the app from starting.
 echo "Checking dependencies…"
 if command -v uv >/dev/null; then
-  uv pip install -q -p .venv/bin/python --upgrade -r requirements.txt
+  uv pip install -q -p .venv/bin/python --upgrade -r requirements.txt || echo "Couldn't update dependencies (offline?) — starting anyway."
 else
   .venv/bin/python -m ensurepip -q >/dev/null 2>&1 || true
-  .venv/bin/python -m pip install -q --upgrade -r requirements.txt
+  .venv/bin/python -m pip install -q --upgrade -r requirements.txt || echo "Couldn't update dependencies (offline?) — starting anyway."
 fi
 
 echo "Starting YT Downloader at http://127.0.0.1:8765  (press Ctrl+C to stop)"

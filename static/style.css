@@ -135,9 +135,10 @@ button.small { padding: 4px 10px; font-size: 13px; }
 .s-paused, .s-queued, .s-new { color: var(--muted); }
 .s-saved { color: var(--accent); }
 .s-complete { color: var(--ok); }
+.s-removed { color: var(--muted); opacity: .8; }
 
 .job-body { border-top: 1px solid var(--border); }
-.job-body > .options, .job-body > .checks, .job-body > .select-bar { padding: 0 16px; }
+.job-body > .options, .job-body > .checks, .job-body > .select-bar, .job-body > .tools { padding: 0 16px; }
 .job-body > .options { padding-top: 14px; }
 .job-body > .select-bar { padding-bottom: 12px; }
 .select-bar .primary { margin-left: auto; }
@@ -220,3 +221,26 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .job-head img { display: none; }
   .job-btns { width: 100%; justify-content: flex-start; }
 }
+
+/* queue-wide wait (offline, rate limited, disk full) */
+.wait-banner {
+  margin: 0 0 16px; padding: 10px 14px; border-radius: 10px; font-size: 14px;
+  border: 1px solid var(--warn); color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+#settings-form label.inline { display: block; }
+#settings-form label.inline small { display: block; margin-top: 4px; }
+#settings-form label.inline input[type="checkbox"] { width: auto; margin-right: 6px; }
+
+/* per-video log ("Details") */
+#log-dialog { width: min(720px, calc(100vw - 32px)); }
+#log-dialog h3 { margin: 0 0 8px; overflow-wrap: anywhere; }
+#log-dialog .err { color: var(--err); font-size: 13px; overflow-wrap: anywhere; }
+.log-lines {
+  max-height: 50vh; overflow: auto; margin: 0; padding: 10px; border-radius: 8px; border: 1px solid var(--border);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word;
+}
+.small-note { font-size: 12px; }
+
+/* file check / clean-up row */
+.tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 13px; }

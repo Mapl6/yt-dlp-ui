@@ -32,9 +32,10 @@ def _friendly(exc: Exception) -> str:
 
 
 class NetMonitor:
-    def __init__(self, get_settings, get_speed):
+    def __init__(self, get_settings, get_speed, on_change=None):
         self._get_settings = get_settings
         self._get_speed = get_speed
+        self._on_change = on_change or (lambda old, new: None)
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self._ydl = None
@@ -112,6 +113,7 @@ class NetMonitor:
                 net = self._probe(TARGETS["internet"])
                 yt = self._probe(TARGETS["youtube"])
                 level, label, advice, bars = self._classify(net, yt)
+                old = self.state.get("level")
                 with self._lock:
                     self.history.append((time.time(), yt["latency"]))
                     self.state = {
@@ -119,9 +121,11 @@ class NetMonitor:
                         "internet": net, "youtube": yt, "proxy": self._proxy or "",
                         "checked": time.time(),
                     }
+                if level != old:
+                    self._on_change(old, level)
             except Exception as exc:  # never let the monitor die
                 with self._lock:
-                    self.state = {"level": "offline", "label": "Check failed", "advice": str(exc)[:200],
+                    self.state = {"level": "checking", "label": "Check failed", "advice": str(exc)[:200],
                                   "bars": 0, "checked": time.time()}
             self._wake.wait(INTERVAL)
             self._wake.clear()
