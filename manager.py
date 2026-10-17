@@ -956,6 +956,7 @@ class Manager:
         self.clock = time.time                         # for the download schedule (tests replace it)
         self._ydls: set = set()                        # running YoutubeDL objects, for the total speed limit
         self.importing: dict | None = None             # progress of "add many links"
+        self._disk_cache: dict[str, tuple] = {}        # folder -> (time, _disk_free result)
         self.updating: dict | None = None              # progress of a yt-dlp update
         self._latest = {"version": None, "checked": 0, "checking": False}   # newest yt-dlp on PyPI
         self.store = Store(DB_FILE, DB_BACKUP)
@@ -2198,8 +2199,19 @@ class Manager:
             speed_hist = list(self.speed_hist)
             jobs = [{"id": j["id"], "title": j["title"]} for j in sorted(self.jobs.values(), key=lambda j: j["title"].lower())]
             hold = dict(self.hold) if self.hold and now < self.hold["until"] else None
+            # What is left to download (all queued and active videos, not only the filtered ones), per folder.
+            need: dict[str, int] = {}
+            left, estimated = 0, False
+            for job, it in self._live.values():
+                size, exact = _estimate_bytes(it, it.get("options") or job["options"])
+                outdir = it.get("outdir") or job["outdir"]
+                need[outdir] = need.get(outdir, 0) + size
+                left += size
+                estimated |= not exact
         recent = self.history(limit=30)["rows"]
         day = self.store.counts_since(now - 86400)
+        recent_speeds = [v for v in speed_hist[-60:] if v]
+        avg = sum(recent_speeds) / len(recent_speeds) if recent_speeds else 0
         return {
             "active": active,
             "queue": queue[:200], "queued": len(queue),
@@ -2211,12 +2223,32 @@ class Manager:
                 "queued": len(queue), "ready": sum(not q["retrying"] for q in queue),
                 "speed": sum(a["speed"] or 0 for a in active),
                 "speed_history": speed_hist[-60:],
+                "avg_speed": avg or None,
+                "left_bytes": left, "left_estimated": estimated,
+                "eta": left / avg if avg and left else None,
+                "disks": self._disks(need),
                 "done_today": day.get("done", 0),
                 "failed_today": day.get("failed", 0),
                 "waiting": reason,
                 "hold": hold,
             },
         }
+
+    def _disks(self, need: dict[str, int]) -> list[dict]:
+        """Free space on each drive that queued videos go to, with what they still need (cached 10 s)."""
+        now, drives = time.time(), {}
+        for outdir, size in need.items():
+            hit = self._disk_cache.get(outdir)
+            if not hit or now - hit[0] > 10:
+                hit = self._disk_cache[outdir] = (now, _disk_free(outdir))
+            d = hit[1]
+            key = d.get("dev", outdir)
+            drive = drives.setdefault(key, {"path": d.get("path") or outdir, "free": d.get("free"),
+                                            "total": d.get("total"), "need": 0, "problem": d.get("problem")})
+            drive["need"] += size
+        for d in drives.values():
+            d["low"] = d["free"] is not None and d["free"] - d["need"] < MIN_FREE_BYTES
+        return list(drives.values())
 
     def history(self, offset: int = 0, limit: int = 30, since_id: int = 0) -> dict:
         """Finished and failed downloads from the event log, newest first, each with the video's status now

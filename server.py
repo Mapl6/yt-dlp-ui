@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import html
+import json
 import os
 import secrets
 import socket
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -30,8 +36,14 @@ STATIC = Path(__file__).parent / "static"
 #    and the custom header forces a CORS preflight that other origins fail.
 TOKEN = secrets.token_urlsafe(24)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
-security = {"any_host": False}    # set when the user deliberately serves on the network (--host 0.0.0.0)
-runtime = {"can_restart": False}  # True when started as "python server.py" (the process can re-exec itself)
+security = {"any_host": False,   # set when the user deliberately serves on the network (--host 0.0.0.0)
+            "password": ""}      # --password / YTDL_PASSWORD: required to open the app (meant for network mode)
+SESSION_COOKIE = "ytdl_session"
+sessions: set[str] = set()        # logged-in browsers (in memory: a restart asks for the password again)
+login_failures: dict[str, deque] = defaultdict(deque)   # client ip -> times of recent wrong passwords
+LOGIN_LIMIT = 5                   # wrong passwords per minute per client
+runtime = {"can_restart": False,  # True when started as "python server.py" (the process can re-exec itself)
+           "server": None}        # the uvicorn.Server, so live streams can end when it shuts down
 
 manager: Manager = None   # type: ignore[assignment]  — created by start_engine()
 net: NetMonitor = None    # type: ignore[assignment]
@@ -97,12 +109,66 @@ class OpenManyRequest(BaseModel):
 async def guard(request: Request, call_next):
     host = (request.headers.get("host") or "").lower()
     host = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    path = request.url.path
     if not security["any_host"] and host not in LOOPBACK_HOSTS:
         return PlainTextResponse("Forbidden: unknown host", status_code=403)
-    if request.url.path.startswith("/api/") and not secrets.compare_digest(
-            request.headers.get("x-token", ""), TOKEN):
-        return JSONResponse({"detail": "Session expired — reload the page."}, status_code=403)
+    if security["password"] and path != "/login" and request.cookies.get(SESSION_COOKIE) not in sessions:
+        if path.startswith("/api/"):
+            return JSONResponse({"detail": "Password needed — reload the page."}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
+    if path.startswith("/api/"):
+        # EventSource can't send headers, so the live stream (only) takes the token from the query string.
+        sent = request.query_params.get("token", "") if path == "/api/stream" else request.headers.get("x-token", "")
+        if not secrets.compare_digest(sent, TOKEN):
+            return JSONResponse({"detail": "Session expired — reload the page."}, status_code=403)
     return await call_next(request)
+
+
+LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>YT Downloader</title><style>
+:root{--bg:#f6f6f4;--card:#fff;--text:#1d1d1b;--muted:#6b6b66;--border:#deded9;--accent:#d93a32}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#20201e;--text:#ecece8;--muted:#a3a39c;--border:#363633}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:16px;box-sizing:border-box}
+form{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:28px;width:100%;max-width:340px}
+h1{font-size:18px;margin:0 0 4px}p{color:var(--muted);margin:0 0 18px}.err{color:var(--accent)}
+input,button{width:100%;box-sizing:border-box;font:inherit;padding:10px 12px;border-radius:9px}
+input{border:1px solid var(--border);background:var(--bg);color:var(--text);margin-bottom:12px}
+button{border:0;background:var(--accent);color:#fff;font-weight:600;cursor:pointer}
+</style></head><body><form method="post" action="/login"><h1>YT Downloader</h1><p class="{cls}">{msg}</p>
+<input type="password" name="password" placeholder="Password" autofocus required autocomplete="current-password">
+<button>Open</button></form></body></html>"""
+
+
+def login_page(msg: str = "Enter the password to open the downloader.", error: bool = False, status: int = 200):
+    page = LOGIN_PAGE.replace("{cls}", "err" if error else "").replace("{msg}", html.escape(msg))
+    return HTMLResponse(page, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/login")
+def login_form():
+    return login_page()
+
+
+@app.post("/login")
+async def login(request: Request):
+    ip = request.client.host if request.client else "?"
+    recent = login_failures[ip]
+    while recent and time.time() - recent[0] > 60:
+        recent.popleft()
+    if len(recent) >= LOGIN_LIMIT:
+        return login_page("Too many wrong passwords — wait a minute and try again.", True, 429)
+    form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
+    given = (form.get("password") or [""])[0]
+    if not security["password"] or not secrets.compare_digest(given.encode(), security["password"].encode()):
+        recent.append(time.time())
+        return login_page("Wrong password.", True, 401)
+    session = secrets.token_urlsafe(32)
+    sessions.add(session)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(SESSION_COOKIE, session, max_age=30 * 86400, httponly=True, samesite="strict")
+    return response
 
 
 @app.get("/")
@@ -120,6 +186,43 @@ def overview():
 @app.get("/api/activity")
 def activity(job: str | None = None, q: str | None = None):
     return manager.activity(job, q)
+
+
+@app.get("/api/stream")
+async def stream(request: Request, job: str | None = None, q: str | None = None):
+    """Server-Sent Events: the overview and the dashboard, pushed when something changes (at most twice a
+    second), and at least every 2 s so countdowns and the connection panel stay current."""
+    def snapshot():
+        return {"overview": overview(), "activity": manager.activity(job, q)}
+
+    async def events():
+        last_version, last_sent = None, 0.0
+        server = runtime["server"]
+        while not (server and server.should_exit) and not await request.is_disconnected():
+            now = time.monotonic()
+            if manager.version != last_version or now - last_sent >= 2:
+                last_version = manager.version
+                data = await run_in_threadpool(snapshot)
+                yield f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+                last_sent = now
+            await asyncio.sleep(0.5)
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/history")
+def history(offset: int = 0, limit: int = 30, since_id: int = 0):
+    return manager.history(max(0, offset), max(1, min(limit, 200)), max(0, since_id))
+
+
+@app.post("/api/history/clear")
+def history_clear():
+    return {"cleared": manager.clear_history()}
+
+
+@app.get("/api/stats")
+def stats(days: int = 30):
+    return manager.stats(days)
 
 
 @app.post("/api/queue/move")
@@ -348,11 +451,15 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--password", default=os.environ.get("YTDL_PASSWORD", ""),
+                        help="require this password to open the app (recommended with --host 0.0.0.0)")
     args = parser.parse_args()
+    security["password"] = args.password
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         security["any_host"] = True
-        print(f"WARNING: serving on {args.host} — anyone who can reach this address can use the downloader.",
-              file=sys.stderr)
+        if not args.password:
+            print(f"WARNING: serving on {args.host} without a password — anyone who can reach this address can "
+                  "use the downloader. Start with --password (or set YTDL_PASSWORD) to protect it.", file=sys.stderr)
     # After a restart the old socket can take a moment to go away: retry for a few seconds then.
     tries = 40 if os.environ.pop("YTDL_RESTARTED", None) else 1
     for attempt in range(tries):
@@ -373,4 +480,8 @@ if __name__ == "__main__":
     start_engine(args.port)
     if not args.no_browser:
         threading.Timer(1.2, lambda: webbrowser.open(f"http://{args.host}:{args.port}")).start()
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # The live stream never ends by itself: don't let it hold up Ctrl+C for more than a moment.
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning",
+                                           timeout_graceful_shutdown=2))
+    runtime["server"] = server
+    server.run()
