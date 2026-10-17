@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import socket
 import sys
 import threading
+import time
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,6 +31,7 @@ STATIC = Path(__file__).parent / "static"
 TOKEN = secrets.token_urlsafe(24)
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 security = {"any_host": False}    # set when the user deliberately serves on the network (--host 0.0.0.0)
+runtime = {"can_restart": False}  # True when started as "python server.py" (the process can re-exec itself)
 
 manager: Manager = None   # type: ignore[assignment]  — created by start_engine()
 net: NetMonitor = None    # type: ignore[assignment]
@@ -79,6 +82,15 @@ class MoveRequest(VideoRef):
 
 class RemoveRequest(BaseModel):
     delete_files: bool = False
+
+
+class SyncRequest(BaseModel):
+    every_hours: float = 0
+    auto_download: bool = False
+
+
+class OpenManyRequest(BaseModel):
+    urls: list[str]
 
 
 @app.middleware("http")
@@ -159,6 +171,43 @@ def open_url(req: OpenRequest):
         raise HTTPException(400, _clean_error(exc))
 
 
+@app.post("/api/open-many")
+def open_many(req: OpenManyRequest):
+    """Add many links (pasted, or from a .txt file) in the background."""
+    try:
+        return manager.open_many(req.urls)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/ytdlp")
+def ytdlp():
+    return manager.ytdlp_info() | {"can_restart": runtime["can_restart"]}
+
+
+@app.post("/api/ytdlp/update")
+def ytdlp_update():
+    return manager.update_ytdlp()
+
+
+@app.post("/api/restart")
+def restart():
+    """Restart the app (to load an updated yt-dlp). Interrupted downloads resume from their .part files."""
+    if not runtime["can_restart"]:
+        raise HTTPException(400, "Quit and open the app again to finish the update.")
+
+    def later():
+        time.sleep(0.5)                       # let this response reach the page first
+        manager.save_state()
+        argv = [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+        if "--no-browser" not in argv:
+            argv.append("--no-browser")       # the open page reloads itself
+        os.environ["YTDL_RESTARTED"] = "1"
+        os.execv(sys.executable, [sys.executable, *argv])   # fds are close-on-exec: lock and port are released
+    threading.Thread(target=later, daemon=True).start()
+    return {"ok": True}
+
+
 @app.get("/api/jobs/{job_id}/items")
 def job_items(job_id: str, since: int = 0):
     try:
@@ -173,8 +222,30 @@ def download(job_id: str, req: DownloadRequest):
         return {"queued": manager.queue(job_id, req.ids, dict(req.options))}
     except KeyError:
         raise HTTPException(404, "Playlist not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     except OSError as exc:
         raise HTTPException(400, f"Can't use that folder: {exc.strerror or exc}")
+
+
+@app.post("/api/jobs/{job_id}/estimate")
+def estimate(job_id: str, req: DownloadRequest):
+    try:
+        return manager.estimate(job_id, req.ids, dict(req.options))
+    except KeyError:
+        raise HTTPException(404, "Playlist not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.put("/api/jobs/{job_id}/sync")
+def job_sync(job_id: str, req: SyncRequest):
+    try:
+        return manager.set_sync(job_id, req.every_hours, req.auto_download)
+    except KeyError:
+        raise HTTPException(404, "Playlist not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.post("/api/jobs/{job_id}/refresh")
@@ -282,12 +353,23 @@ if __name__ == "__main__":
         security["any_host"] = True
         print(f"WARNING: serving on {args.host} — anyone who can reach this address can use the downloader.",
               file=sys.stderr)
-    with socket.socket(socket.AF_INET6 if ":" in args.host else socket.AF_INET) as probe:
-        try:
-            probe.bind((args.host, args.port))
-        except OSError:
-            sys.exit(f"Port {args.port} is already in use — is YT Downloader already running? "
-                     f"Open http://127.0.0.1:{args.port} or stop the other copy first.")
+    # After a restart the old socket can take a moment to go away: retry for a few seconds then.
+    tries = 40 if os.environ.pop("YTDL_RESTARTED", None) else 1
+    for attempt in range(tries):
+        with socket.socket(socket.AF_INET6 if ":" in args.host else socket.AF_INET) as probe:
+            if tries > 1:
+                # only right after our own restart: on macOS this flag would also let the check pass while
+                # another copy listens on 0.0.0.0, so a normal start never sets it
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((args.host, args.port))
+                break
+            except OSError:
+                if attempt == tries - 1:
+                    sys.exit(f"Port {args.port} is already in use — is YT Downloader already running? "
+                             f"Open http://127.0.0.1:{args.port} or stop the other copy first.")
+                time.sleep(0.25)
+    runtime["can_restart"] = True
     start_engine(args.port)
     if not args.no_browser:
         threading.Timer(1.2, lambda: webbrowser.open(f"http://{args.host}:{args.port}")).start()

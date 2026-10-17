@@ -2,7 +2,8 @@
 
 Feature tests: scheduler index and priorities, per-video pause, the event log (history and stats),
 processing sub-steps and format notes, queue controls, schedule and speed limits, file actions,
-playlist removal with files, .m3u export, and the second opinion before calling a file damaged.
+playlist removal with files, .m3u export, the second opinion before calling a file damaged, subtitle
+languages, SponsorBlock, parts of videos, size estimates, subscriptions, adding many links, yt-dlp updates.
 """
 import http.server, json, os, shutil, socketserver, sqlite3, subprocess, sys, tempfile, threading, time
 from pathlib import Path
@@ -371,6 +372,152 @@ check("remove + delete: file another playlist still has is kept", (rm / "02 - Vi
 check("remove + delete: unrelated file kept", (rm / "notes [other].txt").exists())
 check("remove + delete: archive lines of deleted files dropped", M.Manager._archive_ids(str(rm)) == {"test r2"},
       M.Manager._archive_ids(str(rm)))
+
+# ---------- subtitle languages and SponsorBlock options
+o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "en, fa", "auto_subs": True})
+check("subs: chosen languages with regional variants", o["subtitleslangs"] == ["en", "en-.*", "fa", "fa-.*"], o["subtitleslangs"])
+check("subs: auto-generated subtitles", o.get("writeautomaticsub") is True)
+o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "../etc; $(x)"})
+check("subs: bad language codes fall back to English", o["subtitleslangs"] == ["en", "en-.*"], o["subtitleslangs"])
+o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "remove"})
+keys = [p_["key"] for p_ in pps]
+mc = next(p_ for p_ in pps if p_["key"] == "ModifyChapters")
+check("sponsorblock: segments cut before metadata is written", keys.index("ModifyChapters") < keys.index("FFmpegMetadata")
+      and mc["remove_sponsor_segments"] == set(M.SPONSOR_CATEGORIES), (keys, mc))
+o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "mark", "metadata": False})
+check("sponsorblock: mark adds chapters even without metadata",
+      any(p_["key"] == "FFmpegMetadata" and p_["add_chapters"] and not p_["add_metadata"] for p_ in pps)
+      and next(p_ for p_ in pps if p_["key"] == "ModifyChapters")["remove_sponsor_segments"] == set())
+
+# ---------- parts of a video
+check("section: times parsed", M._parse_section({"start": "1:00", "end": "2:30.5"}) == {"start": 60.0, "end": 150.5})
+check("section: empty end = to the end", M._parse_section({"start": "90"}) == {"start": 90.0, "end": None})
+check("section: nothing asked", M._parse_section({"start": "", "end": ""}) is None)
+for bad in ({"start": "abc"}, {"start": "2:00", "end": "1:00"}):
+    try:
+        M._parse_section(bad); raised = False
+    except ValueError:
+        raised = True
+    check(f"section: rejects {bad}", raised)
+check("section: file-name label", M._section_label({"start": 60, "end": 150}) == "1-00–2-30")
+check("section: expected length", M._expected_duration({"duration": 300, "options": {"section": {"start": 60, "end": None}}}) == 240)
+
+# real downloads with SponsorBlock (patched: no internet) and with a part
+M.SponsorBlockPP.EXTRACTORS = {**M.SponsorBlockPP.EXTRACTORS, "Test": "YouTube"}
+segments = {"mode": "fail"}
+def fake_segments(self, video_id, service):
+    if segments["mode"] == "fail":
+        raise OSError("network is unreachable")
+    return [{"segment": [5.0, 10.0], "category": "sponsor", "UUID": "u1", "videoDuration": 30, "actionType": "skip",
+             "description": ""}]
+M.SponsorBlockPP._get_sponsor_segments = fake_segments
+j10 = make_job("ten", ["sb1", "sb2", "part1"])
+it10 = items_of(j10)
+mgr.queue(j10["id"], ["sb1"], dict(OPTS, sponsorblock="remove"))
+level["v"] = "good"
+check("sponsorblock: unavailable API doesn't fail the download", wait(lambda: it10["sb1"]["status"] == "done", 90),
+      (it10["sb1"]["status"], it10["sb1"]["error"]))
+check("sponsorblock: failure noted in the log", any("SponsorBlock segments unavailable" in l for l in it10["sb1"]["log"]),
+      it10["sb1"]["log"][-4:])
+segments["mode"] = "ok"
+mgr.queue(j10["id"], ["sb2"], dict(OPTS, sponsorblock="remove"))
+check("sponsorblock: video with a segment cut is verified, not called incomplete",
+      wait(lambda: it10["sb2"]["status"] in ("done", "failed"), 120) and it10["sb2"]["status"] == "done",
+      (it10["sb2"]["status"], it10["sb2"]["error"], it10["sb2"]["log"][-3:]))
+real = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                             it10["sb2"]["filepath"]], capture_output=True, text=True).stdout or 0)
+check("sponsorblock: 5 s segment removed", 23 < real < 27 and abs(it10["sb2"]["media_duration"] - real) < 2,
+      (real, it10["sb2"].get("media_duration")))
+mgr.queue(j10["id"], ["part1"], dict(OPTS, section={"start": "0:05", "end": "0:15"}))
+check("section: part downloaded and verified", wait(lambda: it10["part1"]["status"] in ("done", "failed"), 120)
+      and it10["part1"]["status"] == "done", (it10["part1"]["status"], it10["part1"]["error"]))
+check("section: own file name", "(0-05–0-15) [part1]" in os.path.basename(it10["part1"]["filepath"] or ""),
+      it10["part1"]["filepath"])
+check("section: not written to the archive", M.Manager._archive_key(it10["part1"]) not in M.Manager._archive_ids(str(out)))
+check("section: playlist keeps no part in its saved options", "section" not in j10["options"])
+level["v"] = "offline"
+mgr.start_check(j10["id"])
+wait(lambda: not j10["check"]["running"])
+check("check files: part and cut video count as healthy", j10["check"]["damaged"] == 0
+      and it10["part1"]["status"] == "done" and it10["sb2"]["status"] == "done", j10["check"])
+
+# ---------- size estimate
+est = mgr.estimate(j6["id"], None, {"quality": "1080"})
+check("estimate: duration × bitrate", est["bytes"] == int(30 * 5e6 / 8) and est["count"] == 1 and est["free"] > 0, est)
+est = mgr.estimate(j6["id"], ["e1"], {"quality": "mp3", "section": {"start": "0", "end": "0:10"}})
+check("estimate: audio, part of a video", est["bytes"] == int(10 * 160e3 / 8), est)
+made = []
+real_mkdir = Path.mkdir
+Path.mkdir = lambda self, *a, **k: made.append(self)
+d = M._disk_free(str(TMP / "not" / "there" / "yet"))
+Path.mkdir = real_mkdir
+check("disk free: nearest existing folder, nothing created", d["free"] > 0 and not made and not (TMP / "not").exists(), d)
+if sys.platform == "darwin":
+    check("disk free: unplugged drive reported", M._disk_free("/Volumes/NoSuchDrive123/x")["problem"])
+
+# ---------- subscriptions: due playlists are refreshed and new videos queued
+fetches = {"n": 0}
+def fake_inspect(url, settings):
+    fetches["n"] += 1
+    ids = ["s1", "s2"] + (["s3"] if fetches["n"] > 1 else [])
+    return {"kind": "playlist", "source_id": "subs", "title": "List subs", "thumbnail": None, "heights": [360],
+            "items": [{"index": i + 1, "id": v, "title": f"Video {v}", "url": f"test://{v}", "duration": 30,
+                       "extractor": "Test"} for i, v in enumerate(ids)]}
+real_inspect = M.inspect_url
+M.inspect_url = fake_inspect
+js = mgr.open_url("test://list-subs")
+jsub = mgr.jobs[js["id"]]
+with mgr.cond:
+    jsub["outdir"] = str(out)
+    jsub["options"] = dict(OPTS)
+try:
+    mgr.set_sync(jsub["id"], 5, True); bad_choice = False
+except ValueError:
+    bad_choice = True
+check("sync: only offered intervals accepted", bad_choice)
+mgr.set_sync(jsub["id"], 6, True)
+check("sync: not due right after it's set", mgr.sync_due() == [])
+with mgr.cond:
+    jsub["sync"]["last"] = time.time() - 7 * 3600
+mgr.net_level = lambda: "offline"
+check("sync: waits while offline", mgr.sync_due() == [])
+mgr.net_level = lambda: level["v"]
+level["v"] = "good"
+mgr.pause_all(True)                     # keep it from downloading; queueing must not resume the playlist
+check("sync: due playlist refreshed", mgr.sync_due() == [jsub["id"]])
+sub_items = items_of(jsub)
+check("sync: new video queued automatically", sub_items["s3"]["status"] == "queued"
+      and sub_items["s1"]["status"] == "new", {k: v["status"] for k, v in sub_items.items()})
+check("sync: paused playlist stays paused", jsub["paused"])
+check("sync: last check recorded", time.time() - jsub["sync"]["last"] < 5)
+mgr.pause_all(False)
+mgr.action(jsub["id"], "stop")
+level["v"] = "offline"
+
+# ---------- add many links at once
+def fake_inspect_many(url, settings):
+    if "broken" in url:
+        raise DownloadError("ERROR: Unsupported URL: " + url)
+    vid = url.rsplit("/", 1)[-1]
+    return {"kind": "video", "source_id": vid, "title": f"Single {vid}", "thumbnail": None, "heights": [360],
+            "items": [{"index": 1, "id": vid, "title": f"Single {vid}", "url": url, "duration": 30, "extractor": "Test"}]}
+M.inspect_url = fake_inspect_many
+res = mgr.open_many(["https://x.test/m1", "not a link", "https://x.test/m1", "https://x.test/broken", "https://x.test/m2"])
+check("import: links cleaned and de-duplicated", res["total"] == 3, res)
+check("import: finishes", wait(lambda: not mgr.importing["running"], 30))
+check("import: progress and failures reported", mgr.importing["added"] == 2 and len(mgr.importing["failed"]) == 1
+      and "Unsupported" in mgr.importing["failed"][0]["error"], mgr.importing)
+check("import: in the overview", mgr.overview()["import"]["done"] == 3)
+M.inspect_url = real_inspect
+
+# ---------- yt-dlp version and update (no network: command and version lookup replaced)
+info = mgr.ytdlp_info()
+check("ytdlp: version reported", info["version"] == M.yt_dlp.version.__version__)
+mgr._update_cmd = lambda: [sys.executable, "-c", "print('updated')"]
+mgr._installed_ytdlp = lambda: "2099.01.01"
+mgr.update_ytdlp()
+check("ytdlp: update runs and asks for a restart", wait(lambda: not mgr.updating["running"], 30)
+      and mgr.updating["ok"] and mgr.updating["restart"] and "updated" in mgr.updating["output"], mgr.updating)
 
 # ---------- backfill: a library from before the event log gets its downloads added once
 lib = TMP / "lib2"; lib.mkdir()

@@ -32,7 +32,8 @@ except ImportError:
 import yt_dlp
 from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.postprocessor.common import PostProcessor
-from yt_dlp.utils import ContentTooShortError, DownloadCancelled, ExtractorError, GeoRestrictedError
+from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
+from yt_dlp.utils import ContentTooShortError, DownloadCancelled, ExtractorError, GeoRestrictedError, download_range_func
 
 DATA_DIR = Path(os.environ.get("YTDL_DATA_DIR") or Path(__file__).parent / "data")
 DB_FILE = DATA_DIR / "library.db"
@@ -65,11 +66,20 @@ DEFAULT_SETTINGS = {
     "schedule_on": False,        # only start downloads between schedule_start and schedule_end (local time)
     "schedule_start": "01:00",
     "schedule_end": "07:00",
+    "sub_langs": "en",           # default subtitle languages, e.g. "en, fa"
 }
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 VIDEO_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
 AUDIO_FORMATS = {"mp3", "m4a", "opus"}
+# Typical total bitrate (bits/s) per quality, to estimate sizes before they are known.
+BITRATES = {2160: 20e6, 1440: 10e6, 1080: 5e6, 720: 2.5e6, 480: 1.2e6, 360: 0.7e6, 240: 0.4e6, 144: 0.2e6}
+BEST_BITRATE, AUDIO_BITRATE = 8e6, 160e3
+SPONSOR_CATEGORIES = ("sponsor", "selfpromo", "interaction")
+SUB_LANG = re.compile(r"^(?:all|[a-z]{2,3}(?:-[a-z0-9]+)*)$", re.I)
+SYNC_TICK = 60           # seconds between checks for playlists due an automatic refresh
+SYNC_CHOICES = (0, 6, 12, 24, 168)                # hours between automatic refreshes (0 = off)
+YTDLP_CHECK_EVERY = 6 * 3600
 
 # Text fallbacks for error classification (exception types and HTTP status are checked first).
 DISK_ERRORS = re.compile(r"no space left|errno 28|disk (?:is )?full|not enough space", re.I)
@@ -224,6 +234,92 @@ def _minutes(hhmm: str) -> int:
     return int(h) * 60 + int(m)
 
 
+def _sub_langs(text: str) -> list[str]:
+    """ "en, fa" -> yt-dlp patterns that also match regional variants (en-US, en-GB…)."""
+    out = []
+    for code in re.split(r"[\s,;]+", text or ""):
+        if SUB_LANG.match(code):
+            out += ["all"] if code.lower() == "all" else [code, f"{code}-.*"]
+    return out or ["en", "en-.*"]
+
+
+def _parse_time(text) -> float | None:
+    """ "90", "1:30", "1:02:03" or "1:30.5" -> seconds (None if it can't be read)."""
+    text = str(text).strip()
+    if not re.fullmatch(r"\d+(?::\d{1,2}){0,2}(?:\.\d+)?", text):
+        return None
+    secs = 0.0
+    for part in text.split(":"):
+        secs = secs * 60 + float(part)
+    return secs
+
+
+def _parse_section(section) -> dict | None:
+    """Validate "download only part": {"start": "1:00", "end": "2:30"} -> {"start": 60.0, "end": 150.0}.
+    An empty end means "to the end of the video". None when no part is asked for."""
+    if not section:
+        return None
+    start_txt, end_txt = str(section.get("start") or "").strip(), str(section.get("end") or "").strip()
+    if not start_txt and not end_txt:
+        return None
+    start = _parse_time(start_txt) if start_txt else 0.0
+    end = _parse_time(end_txt) if end_txt else None
+    if start is None or (end_txt and end is None):
+        raise ValueError("Use times like 1:30, 1:02:03 or 90 for the part to download")
+    if end is not None and end <= start:
+        raise ValueError("The end of the part must be after its start")
+    return {"start": start, "end": end}
+
+
+def _section_label(section: dict) -> str:
+    """For the file name: "1-00–2-30" (no colons, which some systems don't allow)."""
+    end = _fmt_secs(section["end"]) if section.get("end") is not None else "end"
+    return f"{_fmt_secs(section['start'])}–{end}".replace(":", "-")
+
+
+def _expected_duration(item: dict) -> float | None:
+    """Length the finished file should have: as verified at download (parts and cut sponsor segments make
+    it shorter than the video), else the part asked for, else the video's length."""
+    if item.get("media_duration"):
+        return item["media_duration"]
+    section = (item.get("options") or {}).get("section")
+    if section:
+        end = section.get("end") if section.get("end") is not None else item.get("duration")
+        return end - section["start"] if end else None
+    if (item.get("options") or {}).get("sponsorblock") == "remove":
+        return None                                  # length after cutting isn't known
+    return item.get("duration")
+
+
+def _estimate_bytes(item: dict, options: dict) -> tuple[int, bool]:
+    """-> (bytes still to download, exact?). Uses the size yt-dlp reported, else duration × typical bitrate."""
+    if item.get("total") and item["status"] in ("queued", "downloading"):
+        return max(0, int(item["total"]) - int(item.get("downloaded") or 0)), True
+    quality = str(options.get("quality", "best"))
+    bps = AUDIO_BITRATE if quality in AUDIO_FORMATS else BITRATES.get(int(quality), BEST_BITRATE) \
+        if quality.isdigit() else BEST_BITRATE
+    duration = item.get("duration")
+    section = options.get("section")
+    if duration and section:
+        duration = (section["end"] if section.get("end") is not None else duration) - section["start"]
+    return (int(max(0, duration) * bps / 8) if duration else 0), False
+
+
+def _disk_free(path: str) -> dict:
+    """Free space where path is (or would be). Never creates folders; an unplugged drive is reported."""
+    parts = Path(path).parts
+    if sys.platform == "darwin" and len(parts) > 2 and parts[1] == "Volumes" and not Path("/Volumes", parts[2]).is_dir():
+        return {"free": None, "problem": f"Drive “{parts[2]}” is not connected"}
+    p = Path(os.path.expanduser(path))
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        du = shutil.disk_usage(p)
+        return {"free": du.free, "total": du.total, "dev": os.stat(p).st_dev, "path": str(p)}
+    except OSError as exc:
+        return {"free": None, "problem": str(exc.strerror or exc)}
+
+
 def _retry_sleep(n: int) -> float:
     return min(2 ** n, 30)          # 1, 2, 4, … capped at 30 s between yt-dlp's own retries
 
@@ -343,6 +439,17 @@ class _FormatNote(PostProcessor):
         except Exception:                          # a display detail must never break a download
             pass
         return [], info
+
+
+class _SafeSponsorBlock(SponsorBlockPP):
+    """SponsorBlock that never fails a download: if the segment list can't be fetched, download without it."""
+
+    def run(self, info):
+        try:
+            return super().run(info)
+        except Exception as exc:
+            self.report_warning(f"SponsorBlock segments unavailable ({_clean_error(exc)}); continuing without them")
+            return [], info
 
 
 class _FileLock:
@@ -583,11 +690,23 @@ def build_format_opts(options: dict) -> tuple[dict, list]:
         opts["format_sort"] = sort
         opts["merge_output_format"] = container
         if options.get("subtitles"):
-            opts |= {"writesubtitles": True, "subtitleslangs": ["en.*", "en"], "subtitlesformat": "srt/best"}
+            opts |= {"writesubtitles": True, "subtitleslangs": _sub_langs(options.get("sub_langs") or "en"),
+                     "subtitlesformat": "srt/best"}
+            if options.get("auto_subs"):
+                opts["writeautomaticsub"] = True       # YouTube's auto-generated subtitles
             pps.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
 
+    sponsor = options.get("sponsorblock")
+    if sponsor in ("mark", "remove"):
+        # The segments are fetched by _SafeSponsorBlock (added in _download_locked). ModifyChapters must run
+        # before FFmpegMetadata: it cuts the segments ("remove") or turns them into chapters ("mark").
+        cats = set(options.get("sponsor_categories") or SPONSOR_CATEGORIES) & set(SponsorBlockPP.CATEGORIES)
+        pps.append({"key": "ModifyChapters", "remove_sponsor_segments": cats if sponsor == "remove" else set(),
+                    "force_keyframes": False})
     if options.get("metadata", True):
         pps.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
+    elif sponsor == "mark":
+        pps.append({"key": "FFmpegMetadata", "add_metadata": False, "add_chapters": True})
     if options.get("thumbnail", True):
         opts["writethumbnail"] = True
         pps.insert(0, {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
@@ -791,7 +910,7 @@ def _read_legacy_state() -> list:
 
 ITEM_KEYS = ("index", "id", "title", "url", "duration", "number", "status", "progress", "speed",
              "eta", "downloaded", "total", "error", "attempts", "filepath", "removed", "health",
-             "started", "finished", "priority", "held", "step", "fmt")
+             "started", "finished", "priority", "held", "step", "fmt", "section")
 LIVE_LEVELS = {"excellent", "good", "fair", "weak"}
 LIVE = {"queued", *ACTIVE}         # statuses kept in the scheduler's index
 HISTORY_LEN = 20                   # attempts kept per video for the dashboard's detail view
@@ -836,6 +955,9 @@ class Manager:
         self.speed_hist: deque = deque(maxlen=150)     # total speed every SPEED_SAMPLE seconds (5 minutes)
         self.clock = time.time                         # for the download schedule (tests replace it)
         self._ydls: set = set()                        # running YoutubeDL objects, for the total speed limit
+        self.importing: dict | None = None             # progress of "add many links"
+        self.updating: dict | None = None              # progress of a yt-dlp update
+        self._latest = {"version": None, "checked": 0, "checking": False}   # newest yt-dlp on PyPI
         self.store = Store(DB_FILE, DB_BACKUP)
         self._load_state()
         self.last_event = self.store.last_event_id()
@@ -848,6 +970,7 @@ class Manager:
             threading.Thread(target=self._worker, name=f"dl-worker-{i}", daemon=True).start()
         threading.Thread(target=self._saver, name="state-saver", daemon=True).start()
         threading.Thread(target=self._sampler, name="speed-sampler", daemon=True).start()
+        threading.Thread(target=self._syncer, name="auto-sync", daemon=True).start()
 
     # ---- persistence
 
@@ -1240,7 +1363,7 @@ class Manager:
         self.jobs[job["id"]] = job
         return job
 
-    def _merge(self, job: dict, info: dict) -> int:
+    def _merge(self, job: dict, info: dict, added_ids: list | None = None) -> int:
         """Bring a saved playlist up to date with a fresh fetch.
 
         Known videos keep their status and file number; their position follows the playlist.
@@ -1277,6 +1400,8 @@ class Manager:
                 job["items"].append(self._new_item(fresh, job["kind"], width, job["outdir"], rev, number=next_number))
                 next_number += 1
                 added += 1
+                if added_ids is not None and not gone:
+                    added_ids.append(fresh["id"])
         # Videos no longer in the playlist go to the end, in their old order. If most of the playlist seems to
         # be gone, the fetch was probably cut short: keep their flags as they are instead of hiding them.
         fresh_ids = {f["id"] for f in fresh_items}
@@ -1304,17 +1429,212 @@ class Manager:
         return added
 
     def refresh(self, job_id: str) -> int:
+        return len(self._refresh(job_id))
+
+    def _refresh(self, job_id: str) -> list[str]:
+        """Fetch the playlist again; returns the ids of new videos."""
         job = self.get(job_id)
         info = inspect_url(job["url"], self.settings)
+        new_ids: list[str] = []
         with self.cond:
-            added = self._merge(job, info)
+            added = self._merge(job, info, new_ids)
             # Quick health check: a downloaded video whose file has disappeared is flagged.
             for it in job["items"]:
                 if it["status"] == "done" and it.get("filepath") and not os.path.exists(it["filepath"]):
                     self._mark_missing(job, it)
+            if job.get("sync"):
+                job["sync"].update(last=time.time(), error=None)
             self._touch(job)
             log.info("Refreshed %r: %d new videos", job["title"], added)
-            return added
+            return new_ids
+
+    # ---- subscriptions: refresh saved playlists automatically
+
+    def set_sync(self, job_id: str, every_hours: float, auto_download: bool) -> dict:
+        with self.cond:
+            job = self.get(job_id)
+            every = float(every_hours or 0)
+            if every not in SYNC_CHOICES:
+                raise ValueError("Choose how often to check: off, 6, 12, 24 hours or weekly")
+            old = job.get("sync") or {}
+            job["sync"] = {"every": every, "auto": bool(auto_download), "last": old.get("last") or time.time(),
+                           "error": None}
+            self._touch(job)
+            log.info("Auto-check for %r: every %sh, auto-download %s", job["title"], every, bool(auto_download))
+            return dict(job["sync"])
+
+    def _syncer(self):
+        while True:
+            time.sleep(SYNC_TICK)
+            try:
+                self.sync_due()
+            except Exception:
+                log.exception("Automatic playlist check failed")
+
+    def sync_due(self) -> list[str]:
+        """Refresh every playlist whose automatic check is due; queue the new videos if asked. Returns the
+        ids of the playlists checked."""
+        if self.net_level() in ("offline", "blocked"):
+            return []
+        now = time.time()
+        with self.cond:
+            due = [j["id"] for j in self.jobs.values()
+                   if (j.get("sync") or {}).get("every") and now - (j["sync"].get("last") or 0) >= j["sync"]["every"] * 3600]
+        for job_id in due:
+            try:
+                new_ids = self._refresh(job_id)
+            except KeyError:
+                continue
+            except Exception as exc:
+                with self.cond:
+                    job = self.jobs.get(job_id)
+                    if job and job.get("sync"):
+                        # try again in 30 minutes rather than at every tick
+                        job["sync"].update(error=_clean_error(exc), last=now - job["sync"]["every"] * 3600 + 1800)
+                        self._touch(job)
+                log.warning("Automatic check of %s failed: %s", job_id, _clean_error(exc))
+                continue
+            with self.cond:
+                job = self.jobs.get(job_id)
+                if job and new_ids and job["sync"].get("auto"):
+                    paused = job["paused"]
+                    try:
+                        n = self.queue(job_id, new_ids, dict(job["options"]))
+                    except (OSError, ValueError) as exc:
+                        log.warning("Auto-download of new videos in %r failed: %s", job["title"], exc)
+                        continue
+                    job["paused"] = paused                   # queueing must not resume a paused playlist
+                    self._touch(job)
+                    log.info("Auto-download: queued %d new videos of %r", n, job["title"])
+        return due
+
+    # ---- adding many links at once
+
+    def open_many(self, urls: list[str]) -> dict:
+        """Add a list of links one after another in the background (progress in overview()["import"])."""
+        clean, seen = [], set()
+        for url in urls:
+            url = str(url).strip()
+            if re.match(r"https?://", url) and url not in seen:
+                seen.add(url)
+                clean.append(url)
+        if not clean:
+            raise ValueError("No links found — paste links starting with https://")
+        with self.cond:
+            if self.importing and self.importing["running"]:
+                raise ValueError("Still adding the previous links — wait for them to finish")
+            self.importing = {"running": True, "total": len(clean[:500]), "done": 0, "added": 0, "failed": [],
+                              "current": None, "started": time.time()}
+            self.version += 1
+        threading.Thread(target=self._import, args=(clean[:500],), name="import-links", daemon=True).start()
+        return dict(self.importing)
+
+    def _import(self, urls: list[str]):
+        for url in urls:
+            with self.cond:
+                self.importing["current"] = url
+                self.version += 1
+            try:
+                self.open_url(url)
+                ok = True
+            except Exception as exc:
+                ok = False
+                err = _clean_error(exc)
+            with self.cond:
+                self.importing["done"] += 1
+                if ok:
+                    self.importing["added"] += 1
+                else:
+                    self.importing["failed"].append({"url": url, "error": err})
+                self.version += 1
+        with self.cond:
+            self.importing.update(running=False, current=None, finished=time.time())
+            self.version += 1
+        log.info("Added %d of %d links", self.importing["added"], len(urls))
+
+    # ---- size estimate before queueing
+
+    def estimate(self, job_id: str, ids: list[str] | None, options: dict) -> dict:
+        options = dict(options)
+        options["section"] = _parse_section(options.get("section"))
+        with self.cond:
+            job = self.get(job_id)
+            wanted = set(ids) if ids is not None else None
+            chosen = [it for it in job["items"] if it["status"] in ("new", "failed") and not it.get("removed")
+                      and (wanted is None or it["id"] in wanted)]
+            sizes = [_estimate_bytes(it, options) for it in chosen]
+            outdir = os.path.expanduser((options.get("output_dir") or "").strip()) or job["outdir"]
+        total = sum(b for b, _ in sizes)
+        disk = _disk_free(outdir)
+        free = disk.get("free")
+        return {"bytes": total, "count": len(chosen), "unknown": sum(1 for (b, _) in sizes if not b),
+                "free": free, "problem": disk.get("problem"),
+                "low": free is not None and total > free - MIN_FREE_BYTES}
+
+    # ---- yt-dlp version and update
+
+    def ytdlp_info(self) -> dict:
+        """The yt-dlp version in use, and the newest one on PyPI (looked up in the background, cached)."""
+        with self.cond:
+            stale = time.time() - self._latest["checked"] > YTDLP_CHECK_EVERY and not self._latest["checking"]
+            if stale:
+                self._latest["checking"] = True
+        if stale:
+            threading.Thread(target=self._check_latest, name="ytdlp-latest", daemon=True).start()
+        with self.cond:
+            return {"version": yt_dlp.version.__version__, "latest": self._latest["version"],
+                    "checked": self._latest["checked"] or None, "update": dict(self.updating) if self.updating else None}
+
+    def _check_latest(self):
+        version = None
+        try:
+            with yt_dlp.YoutubeDL(_base_opts(self.settings)) as ydl:
+                data = json.loads(ydl.urlopen("https://pypi.org/pypi/yt-dlp/json").read())
+            version = data["info"]["version"]
+        except Exception as exc:
+            log.info("Couldn't check for a newer yt-dlp: %s", _clean_error(exc))
+        with self.cond:
+            self._latest.update(checking=False, checked=time.time() if version else 0, version=version or self._latest["version"])
+            self.version += 1
+
+    def _update_cmd(self) -> list[str]:
+        if shutil.which("uv"):
+            return ["uv", "pip", "install", "-q", "-p", sys.executable, "--upgrade", "yt-dlp[default]"]
+        return [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "yt-dlp[default]"]
+
+    @staticmethod
+    def _installed_ytdlp() -> str | None:
+        """Version on disk (may be newer than the one loaded until the app restarts)."""
+        try:
+            res = subprocess.run([sys.executable, "-c", "import yt_dlp.version as v; print(v.__version__)"],
+                                 capture_output=True, text=True, timeout=60)
+            return res.stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def update_ytdlp(self) -> dict:
+        with self.cond:
+            if self.updating and self.updating["running"]:
+                return dict(self.updating)
+            self.updating = {"running": True, "ok": None, "output": "", "installed": None, "started": time.time()}
+            self.version += 1
+        threading.Thread(target=self._run_update, name="ytdlp-update", daemon=True).start()
+        return dict(self.updating)
+
+    def _run_update(self):
+        try:
+            res = subprocess.run(self._update_cmd(), capture_output=True, text=True, timeout=600)
+            ok, output = res.returncode == 0, (res.stdout + res.stderr).strip()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            ok, output = False, str(exc)
+        installed = self._installed_ytdlp() if ok else None
+        with self.cond:
+            self.updating.update(running=False, ok=ok, output=output[-2000:], installed=installed,
+                                 restart=bool(installed and installed != yt_dlp.version.__version__))
+            if installed:
+                self._latest.update(version=installed if installed > (self._latest["version"] or "") else self._latest["version"])
+            self.version += 1
+        log.info("yt-dlp update: %s (installed %s)", "ok" if ok else "failed", installed)
 
     # ---- file health ("Check files") and clean-up
 
@@ -1387,7 +1707,7 @@ class Manager:
                     if not paths:
                         outcome, path, problem, rescued = "missing", None, None, False
                     else:
-                        path, (problem, rescued) = paths[0], verify(paths[0], it.get("duration"))
+                        path, (problem, rescued) = paths[0], verify(paths[0], _expected_duration(it))
                         outcome = "damaged" if problem else "ok"
                 elif paths:                                   # not marked downloaded, but a file is there
                     path, (problem, rescued) = paths[0], verify(paths[0], it.get("duration"))
@@ -1497,10 +1817,13 @@ class Manager:
         with self.cond:
             job = self.get(job_id)
             outdir = os.path.expanduser((options.pop("output_dir", "") or "").strip()) or job["outdir"]
+            section = _parse_section(options.pop("section", None))
             problem = _folder_problem(outdir)
             if problem:
                 raise OSError(problem)
-            job.update(outdir=outdir, options=options, paused=False)
+            job.update(outdir=outdir, options=dict(options), paused=False)   # a part is only for this download
+            if section:
+                options["section"] = section
             wanted = set(ids) if ids is not None else None
             count = 0
             for it in job["items"]:
@@ -1808,6 +2131,7 @@ class Manager:
             "status": status, "rev": job["rev"], "total": total, "counts": counts, "speed": speed,
             "percent": round(100 * min(counts["done"], available) / available, 2) if available else 0,
             "check": {k: v for k, v in (job.get("check") or {}).items() if k != "stop"} or None,
+            "sync": job.get("sync"), "paused": job["paused"],
         }
 
     def items_since(self, job_id: str, since: int) -> dict:
@@ -1830,6 +2154,8 @@ class Manager:
             "speed": sum(j["speed"] for j in jobs),
             "waiting": self.waiting_reason() if queued else None,
             "settings": self.settings,
+            "import": dict(self.importing) if self.importing else None,
+            "last_event": self.last_event,
         }
 
     def activity(self, job_id: str | None = None, q: str | None = None) -> dict:
@@ -1973,7 +2299,8 @@ class Manager:
         options = item.get("options") or job["options"]
         outdir = item.get("outdir") or job["outdir"]
         archive_key = self._archive_key(item)
-        skip_existing = options.get("skip_existing", True)
+        # A part of a video is never "the video": it isn't checked against or written to the archive.
+        skip_existing = options.get("skip_existing", True) and not options.get("section")
 
         problem = _folder_problem(outdir)
         if problem:                                       # e.g. external drive unplugged: wait, don't fail
@@ -2041,7 +2368,11 @@ class Manager:
 
         fmt_opts, pps = build_format_opts(options)
         prefix = f"{item['number']} - " if item["number"] and options.get("numbering", True) else ""
-        tmpl = os.path.join(_escape_tmpl(outdir), _escape_tmpl(prefix) + "%(title).150B [%(id)s].%(ext)s")
+        section = options.get("section")
+        # A part gets its own name ("Title (1-00–2-30) [id].mp4"), so it never collides with the full video.
+        suffix = f" ({_section_label(section)})" if section else ""
+        tmpl = os.path.join(_escape_tmpl(outdir), _escape_tmpl(prefix) + "%(title).150B" + _escape_tmpl(suffix)
+                            + " [%(id)s].%(ext)s")
 
         logger = _ItemLogger(lambda level, msg: self._item_log(job, item, level, msg))
         opts = _base_opts(self.settings, logger) | fmt_opts | {
@@ -2061,6 +2392,9 @@ class Manager:
         rate = self._rate_for(len(self._ydls) + 1)
         if rate:
             opts["ratelimit"] = rate
+        if section:
+            opts["download_ranges"] = download_range_func(None, [(section["start"], section["end"] or float("inf"))])
+            opts["force_keyframes_at_cuts"] = True
         if str(options.get("quality", "best")) not in AUDIO_FORMATS:
             # Keep the separate video/audio streams until the merged file is verified, so a bad merge can be
             # redone locally instead of downloading everything again. They are deleted below once it's good.
@@ -2073,6 +2407,9 @@ class Manager:
                         ydl.add_post_processor(_PlaylistTags({"album": job["title"], "track": item["number"].lstrip("0")}),
                                                when="pre_process")
                     ydl.add_post_processor(_FormatNote(lambda fmt: self._set(job, item, fmt=fmt)), when="before_dl")
+                    if options.get("sponsorblock") in ("mark", "remove"):
+                        cats = set(options.get("sponsor_categories") or SPONSOR_CATEGORIES)
+                        ydl.add_post_processor(_SafeSponsorBlock(ydl, categories=cats), when="after_filter")
                     with self.cond:
                         self._ydls.add(ydl)
                     self._rebalance()
@@ -2082,7 +2419,13 @@ class Manager:
                         with self.cond:
                             self._ydls.discard(ydl)
                         self._rebalance()
-                filepath = ((info.get("requested_downloads") or [{}])[0].get("filepath")) or info.get("filepath")
+                done_info = (info.get("requested_downloads") or [{}])[0]
+                filepath = done_info.get("filepath") or info.get("filepath")
+                # The processed info has the real length: shorter for a part, or after cutting sponsor segments.
+                expected = done_info.get("duration") or info.get("duration") or item.get("duration")
+                if section:                               # yt-dlp doesn't shorten the duration for a part
+                    end = section["end"] if section["end"] is not None else expected
+                    expected = max(0.0, min(end, expected or end) - section["start"]) if end else None
                 parts = _part_files(outdir, item["id"])
                 self._set(job, item, status="processing", step="Checking stream sizes", speed=None, eta=None)
                 bad = _check_part_sizes(info, parts)
@@ -2091,7 +2434,7 @@ class Manager:
                     raise _IncompleteFile(bad)
                 live = info.get("is_live") or info.get("was_live")
                 self._set(job, item, step="Verifying")
-                problem = _verify_file(filepath, None if live else (info.get("duration") or item.get("duration")))
+                problem = _verify_file(filepath, None if live else expected)
                 if not problem:
                     break
                 if filepath and os.path.isfile(filepath):
@@ -2114,7 +2457,8 @@ class Manager:
             if skip_existing:
                 self._archive_add(outdir, archive_key)
             self._set(job, item, status="done", progress=100.0, filepath=filepath, error=None, finished=time.time(),
-                      attempts=0, net_attempts=0, health="ok", checked=time.time(), file_problem=None)
+                      attempts=0, net_attempts=0, health="ok", checked=time.time(), file_problem=None,
+                      media_duration=None if live else expected, section=section)
             self._item_log(job, item, "info", f"Done and verified: {os.path.basename(filepath)}")
             self._event(job, item, "done")
             with self.cond:
