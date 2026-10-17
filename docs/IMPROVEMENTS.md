@@ -9,6 +9,53 @@ Last updated 2026-10-16. Open work first; finished work is summarized at the end
 3. **Subtitle languages:** choose languages, including auto-generated subtitles (English is hard-coded today).
 4. **Desktop notification** when a playlist finishes.
 
+## Activity dashboard: next steps
+
+The dashboard (Activity panel) shows what's downloading, the queue and recent results. Planned additions:
+
+### Queue control
+
+- **Reorder the queue:** "Move to top" / "Move to bottom" per video, and drag to reorder. Today `_next_item` picks by playlist creation date and then playlist order. This needs a `priority` field that the scheduler sorts by first.
+- **Pause / resume one video** without removing it from the queue (today only the whole playlist can be paused).
+- **Pause all / Resume all** buttons in the dashboard header.
+- **"Try now"** for a video waiting on a retry: clears its `next_try`. Also a "Try now" on the queue-wide hold banner (rate limit, disk full) for when the user has fixed the cause.
+- **Retry all failed** across every playlist, from the "Recently finished" tab.
+
+### More detail
+
+- **Expandable row** per video, showing:
+  - chosen format and resolution;
+  - output folder and file name;
+  - each attempt with its error kind (network, rate limit, other);
+  - the log lines inline, instead of in the Details dialog.
+- **Processing sub-step:** "Merging", "Verifying", "Embedding thumbnail", "Re-merging from kept streams" instead of only "Processing".
+- **Time left for the whole queue:** estimated from known sizes (or duration × bitrate for the chosen quality) and the recent average speed.
+- **Disk tile:** free space on each target drive next to the estimated size of the queue, warning before the 1 GB low-disk hold kicks in.
+- **Speed chart:** total download speed over the last few minutes, like the connection panel's response-time chart.
+- **Per-playlist filter** and title search in the dashboard lists.
+
+### History
+
+- **Real event log:** a SQLite table of finished and failed downloads, with time, size and duration.
+  - "Recently finished" is built from each video's current status, so a video re-queued or retried disappears from it.
+  - Videos downloaded before the dashboard existed have no `finished` time, so they never appear in it.
+- **Stats from the log:**
+  - GB downloaded per day or week;
+  - success rate;
+  - average speed;
+  - most common error kinds.
+
+  This would cover the "History and stats page" idea below.
+- **Clear** button and "show more" paging for "Recently finished" (it shows the last 30 today).
+- **Actions on finished rows:** Reveal in Finder, Play.
+
+### Polish
+
+- **Browser tab title shows progress,** e.g. "↓3 · 42% — YT Downloader", so it's visible from another tab.
+- **Desktop notification when a video fails permanently,** not only when a playlist finishes.
+- **Collapse the dashboard** when nothing is queued, remembered per browser.
+- **Faster `/api/activity`:** it scans every item of every playlist each second. Keep running counters, or push changes with SSE (see Performance below).
+
 ## Open issues
 
 | Issue | Fix |
@@ -73,6 +120,15 @@ Last updated 2026-10-16. Open work first; finished work is summarized at the end
 - Separate video/audio streams are kept until the merged file passes the check; a bad merge is redone from them without downloading again.
 - **Check files** button: verifies existing downloads, renames damaged files to `.damaged`, flags missing ones and adopts good files already in the folder. "Check for new videos" also flags files that have disappeared.
 - **Clean up leftovers** button: deletes partial downloads, unmerged streams and `.damaged` files after showing the list.
+
+### Activity dashboard
+
+- **Activity** panel across all playlists, backed by `GET /api/activity`.
+  - Totals: downloading out of the current limit, queued (ready or waiting), total speed and data left, done and failed in the last 24 hours.
+  - **Downloading now** tab: progress, size, speed, time left, start time and attempt number for each video.
+  - **Up next** tab: the queue in scheduler order, with why each video is waiting.
+  - **Recently finished** tab: with Retry and Details.
+- Videos now record `started` and `finished` times.
 
 ### Storage, logging, safety
 
