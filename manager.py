@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -281,6 +282,31 @@ class _PlaylistTags(PostProcessor):
         return [], info
 
 
+def _describe_format(info: dict) -> str:
+    """ "1920x1080 · avc1 + mp4a · mp4" for the formats yt-dlp picked."""
+    fmts = info.get("requested_formats") or [info]
+    res = next((f.get("resolution") for f in fmts if f.get("height")), None) or info.get("resolution")
+    codecs = [next((f.get(k) for f in fmts if f.get(k) not in (None, "none")), None) for k in ("vcodec", "acodec")]
+    bits = [res if res and res != "audio only" else None,
+            " + ".join(c.split(".")[0] for c in codecs if c), info.get("ext")]
+    return " · ".join(b for b in bits if b)
+
+
+class _FormatNote(PostProcessor):
+    """Runs after format selection, before the download: reports which format was chosen."""
+
+    def __init__(self, report):
+        super().__init__()
+        self.report = report
+
+    def run(self, info):
+        try:
+            self.report(_describe_format(info))
+        except Exception:                          # a display detail must never break a download
+            pass
+        return [], info
+
+
 class _FileLock:
     """An exclusive, non-blocking OS lock. Released automatically if the process dies."""
 
@@ -528,10 +554,18 @@ class Store:
         CREATE TABLE IF NOT EXISTS jobs  (id TEXT PRIMARY KEY, data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS items (job_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
                                           PRIMARY KEY (job_id, id));
+        CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL,
+                                           job_id TEXT, job_title TEXT, item_id TEXT, title TEXT, url TEXT,
+                                           status TEXT, kind TEXT, error TEXT, bytes INTEGER, seconds REAL,
+                                           filepath TEXT, hidden INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS events_time ON events (time);
     """
+    EVENT_COLS = ("time", "job_id", "job_title", "item_id", "title", "url", "status", "kind", "error", "bytes",
+                  "seconds", "filepath")
 
     def __init__(self, path: Path, backup: Path):
         self.path, self.backup_path = path, backup
+        self._lock = threading.Lock()     # one connection, shared by the workers and the saver
         try:
             self.conn = self._connect()
         except sqlite3.DatabaseError as exc:
@@ -554,18 +588,20 @@ class Store:
             conn.executescript(self.SCHEMA)
             if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise sqlite3.DatabaseError("integrity check failed")
+            self.version = conn.execute("PRAGMA user_version").fetchone()[0]   # 0: event log not filled yet
         except sqlite3.DatabaseError:
             conn.close()
             raise
         return conn
 
     def load(self) -> list[dict]:
-        jobs = {jid: json.loads(data) for jid, data in self.conn.execute("SELECT id, data FROM jobs")}
-        for job in jobs.values():
-            job["items"] = []
-        for jid, data in self.conn.execute("SELECT job_id, data FROM items"):
-            if jid in jobs:
-                jobs[jid]["items"].append(json.loads(data))
+        with self._lock:
+            jobs = {jid: json.loads(data) for jid, data in self.conn.execute("SELECT id, data FROM jobs")}
+            for job in jobs.values():
+                job["items"] = []
+            for jid, data in self.conn.execute("SELECT job_id, data FROM items"):
+                if jid in jobs:
+                    jobs[jid]["items"].append(json.loads(data))
         for job in jobs.values():
             job["items"].sort(key=lambda it: it.get("index", 0))
         return list(jobs.values())
@@ -573,26 +609,104 @@ class Store:
     def write(self, jobs: list[tuple[str, str]], items: list[tuple[str, str, str]], deleted: list[str]):
         if not (jobs or items or deleted):
             return
-        cur = self.conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            cur.executemany("DELETE FROM items WHERE job_id = ?", [(j,) for j in deleted])
-            cur.executemany("DELETE FROM jobs WHERE id = ?", [(j,) for j in deleted])
-            cur.executemany("INSERT OR REPLACE INTO jobs (id, data) VALUES (?, ?)", jobs)
-            cur.executemany("INSERT OR REPLACE INTO items (job_id, id, data) VALUES (?, ?, ?)", items)
-            cur.execute("COMMIT")
-        except BaseException:
-            cur.execute("ROLLBACK")
-            raise
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                cur.executemany("DELETE FROM items WHERE job_id = ?", [(j,) for j in deleted])
+                cur.executemany("DELETE FROM jobs WHERE id = ?", [(j,) for j in deleted])
+                cur.executemany("INSERT OR REPLACE INTO jobs (id, data) VALUES (?, ?)", jobs)
+                cur.executemany("INSERT OR REPLACE INTO items (job_id, id, data) VALUES (?, ?, ?)", items)
+                cur.execute("COMMIT")
+            except BaseException:
+                cur.execute("ROLLBACK")
+                raise
 
     def backup(self):
         tmp = self.backup_path.with_name(self.backup_path.name + ".tmp")
         dst = sqlite3.connect(tmp)
         try:
-            self.conn.backup(dst)
+            with self._lock:
+                self.conn.backup(dst)
         finally:
             dst.close()
         os.replace(tmp, self.backup_path)
+
+    # ---- event log: one row per finished or failed download, kept even when the video is retried later
+
+    def add_events(self, rows: list[dict]) -> int:
+        """Append events; returns the id of the last one."""
+        if not rows:
+            return self.last_event_id()
+        cols = ", ".join(self.EVENT_COLS)
+        marks = ", ".join("?" * len(self.EVENT_COLS))
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                cur.executemany(f"INSERT INTO events ({cols}) VALUES ({marks})",
+                                [tuple(r.get(c) for c in self.EVENT_COLS) for r in rows])
+                cur.execute("COMMIT")
+            except BaseException:
+                cur.execute("ROLLBACK")
+                raise
+            return cur.lastrowid
+
+    def set_version(self, version: int):
+        with self._lock:
+            self.conn.execute(f"PRAGMA user_version = {int(version)}")
+            self.version = version
+
+    def last_event_id(self) -> int:
+        with self._lock:
+            return self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+
+    def events(self, offset: int = 0, limit: int = 30, since_id: int = 0, hidden: bool = False) -> list[dict]:
+        """Newest first. hidden=False leaves out rows the user cleared from "Recently finished"."""
+        where = "id > ?" + ("" if hidden else " AND hidden = 0")
+        with self._lock:
+            cur = self.conn.execute(f"SELECT id, {', '.join(self.EVENT_COLS)} FROM events WHERE {where} "
+                                    "ORDER BY time DESC, id DESC LIMIT ? OFFSET ?", (since_id, limit, offset))
+            names = [d[0] for d in cur.description]
+            return [dict(zip(names, row)) for row in cur.fetchall()]
+
+    def count_events(self, hidden: bool = False) -> int:
+        with self._lock:
+            return self.conn.execute("SELECT COUNT(*) FROM events" + ("" if hidden else " WHERE hidden = 0")).fetchone()[0]
+
+    def counts_since(self, since: float) -> dict[str, int]:
+        with self._lock:
+            return dict(self.conn.execute("SELECT status, COUNT(*) FROM events WHERE time >= ? GROUP BY status",
+                                          (since,)).fetchall())
+
+    def hide_events(self) -> int:
+        with self._lock:
+            return self.conn.execute("UPDATE events SET hidden = 1 WHERE hidden = 0").rowcount
+
+    def stats(self, since: float) -> dict:
+        """Totals and per-day figures for the History & stats view (all events, cleared or not)."""
+        with self._lock:
+            days = self.conn.execute(
+                "SELECT date(time, 'unixepoch', 'localtime') AS day, "
+                "SUM(status = 'done'), SUM(status = 'failed'), COALESCE(SUM(CASE WHEN status = 'done' THEN bytes END), 0) "
+                "FROM events WHERE time >= ? GROUP BY day ORDER BY day", (since,)).fetchall()
+            done, failed, total_bytes = self.conn.execute(
+                "SELECT COALESCE(SUM(status = 'done'), 0), COALESCE(SUM(status = 'failed'), 0), "
+                "COALESCE(SUM(CASE WHEN status = 'done' THEN bytes END), 0) FROM events WHERE time >= ?",
+                (since,)).fetchone()
+            timed_bytes, seconds = self.conn.execute(
+                "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(seconds), 0) FROM events "
+                "WHERE time >= ? AND status = 'done' AND seconds > 0 AND bytes > 0", (since,)).fetchone()
+            kinds = self.conn.execute(
+                "SELECT COALESCE(kind, 'other'), COUNT(*) FROM events WHERE time >= ? AND status = 'failed' "
+                "GROUP BY 1 ORDER BY 2 DESC LIMIT 6", (since,)).fetchall()
+        return {
+            "days": [{"day": d, "done": n or 0, "failed": f or 0, "bytes": b or 0} for d, n, f, b in days],
+            "done": done, "failed": failed, "bytes": total_bytes,
+            "success": round(100 * done / (done + failed), 1) if done + failed else None,
+            "avg_speed": timed_bytes / seconds if seconds else None,
+            "kinds": [{"kind": k, "count": c} for k, c in kinds],
+        }
 
 
 def _read_legacy_state() -> list:
@@ -622,8 +736,18 @@ def _read_legacy_state() -> list:
 #  * every change to an item goes through the lock (self.cond).
 
 ITEM_KEYS = ("index", "id", "title", "url", "duration", "number", "status", "progress", "speed",
-             "eta", "downloaded", "total", "error", "attempts", "filepath", "removed", "health")
+             "eta", "downloaded", "total", "error", "attempts", "filepath", "removed", "health",
+             "started", "finished", "priority", "held", "step", "fmt")
 LIVE_LEVELS = {"excellent", "good", "fair", "weak"}
+LIVE = {"queued", *ACTIVE}         # statuses kept in the scheduler's index
+HISTORY_LEN = 20                   # attempts kept per video for the dashboard's detail view
+SPEED_SAMPLE = 2                   # seconds between total-speed samples (speed chart, queue ETA)
+
+# Postprocessor (pp_key) -> sub-step shown while a video is processing. Keys starting with "_" are ours.
+PP_STEPS = {"Merger": "Merging", "ExtractAudio": "Converting audio", "EmbedThumbnail": "Embedding thumbnail",
+            "Metadata": "Writing metadata", "EmbedSubtitle": "Embedding subtitles",
+            "ModifyChapters": "Removing sponsor segments", "VideoConvertor": "Converting", "VideoRemuxer": "Remuxing"}
+PP_QUIET = {"ThumbnailsConvertor", "SponsorBlock", "MoveFilesAfterDownload"}   # run before/around the download
 
 
 class Manager:
@@ -652,14 +776,22 @@ class Manager:
         self._save_lock = threading.Lock()
         self._archive_lock = threading.Lock()
         self._last_backup = time.time()
+        self._live: dict[tuple[str, str], tuple[dict, dict]] = {}   # queued/active items, for the scheduler
+        self._order: list | None = None                # _live in scheduler order (None: sort again)
+        self.version = 0                               # bumped on every change; the live stream watches it
+        self.speed_hist: deque = deque(maxlen=150)     # total speed every SPEED_SAMPLE seconds (5 minutes)
         self.store = Store(DB_FILE, DB_BACKUP)
         self._load_state()
+        self.last_event = self.store.last_event_id()
+        if self.store.version < 1:
+            self._backfill_events()
         if not DB_BACKUP.exists():
             self.store.backup()                          # never run without a backup to fall back on
         log.info("Started with %d playlists", len(self.jobs))
         for i in range(MAX_WORKERS):
             threading.Thread(target=self._worker, name=f"dl-worker-{i}", daemon=True).start()
         threading.Thread(target=self._saver, name="state-saver", daemon=True).start()
+        threading.Thread(target=self._sampler, name="speed-sampler", daemon=True).start()
 
     # ---- persistence
 
@@ -687,8 +819,12 @@ class Manager:
                 it.setdefault("net_attempts", 0)
                 it.setdefault("removed", False)
                 it.setdefault("log", [])
-                it.update(speed=None, eta=None, next_try=0, cancel=False)
+                it.setdefault("priority", 0)
+                it.setdefault("held", False)
+                it.setdefault("history", [])
+                it.update(speed=None, eta=None, next_try=0, cancel=False, step=None)
             self.jobs[job["id"]] = job
+            self._reindex(job)
             if not migrated:
                 self._saved_rev[job["id"]] = job["rev"]
         if migrated:
@@ -721,6 +857,57 @@ class Manager:
                 self.store.backup()
                 self._last_backup = time.time()
 
+    def _sampler(self):
+        while True:
+            time.sleep(SPEED_SAMPLE)
+            self.speed_hist.append(self.total_speed())
+
+    def _backfill_events(self):
+        """First start with the event log: add the videos downloaded before it existed, dated by their files."""
+        rows = []
+        with self.cond:
+            items = [(job, it) for job in self.jobs.values() for it in job["items"]
+                     if it["status"] in ("done", "skipped") and it.get("filepath")]
+        for job, it in items:
+            try:
+                st = os.stat(it["filepath"])
+            except OSError:
+                continue
+            rows.append({"time": it.get("finished") or st.st_mtime, "job_id": job["id"], "job_title": job["title"],
+                         "item_id": it["id"], "title": it["title"], "url": it.get("url"), "status": "done",
+                         "bytes": st.st_size, "filepath": it["filepath"]})
+        rows.sort(key=lambda r: r["time"])
+        try:
+            self.last_event = self.store.add_events(rows)
+            self.store.set_version(1)
+        except sqlite3.Error as exc:
+            log.error("Could not fill the event log: %s", exc)
+            return
+        if rows:
+            log.info("Event log: added %d earlier downloads", len(rows))
+
+    def _event(self, job: dict, item: dict, status: str, kind: str | None = None):
+        """Record a finished or failed download in the event log (call outside self.cond)."""
+        with self.cond:
+            fp = item.get("filepath") if status == "done" else None
+            started, finished = item.get("started"), item.get("finished") or time.time()
+            row = {"time": finished, "job_id": job["id"], "job_title": job["title"], "item_id": item["id"],
+                   "title": item["title"], "url": item.get("url"), "status": status, "kind": kind,
+                   "error": item.get("error") if status == "failed" else None, "filepath": fp,
+                   "seconds": finished - started if status == "done" and started else None}
+        try:
+            row["bytes"] = os.path.getsize(fp) if fp else None
+        except OSError:
+            row["bytes"] = None
+        try:
+            last = self.store.add_events([row])
+        except sqlite3.Error as exc:
+            log.error("Could not write to the event log: %s", exc)
+            return
+        with self.cond:
+            self.last_event = last
+            self.version += 1
+
     def _saver(self):
         while True:
             time.sleep(3)
@@ -734,6 +921,7 @@ class Manager:
         with self.cond:
             self.settings = _coerce_settings(self.settings | {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
             _atomic_write(SETTINGS_FILE, json.dumps(self.settings, indent=2))
+            self.version += 1
             self.cond.notify_all()
             log.info("Settings changed: %s", {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
             return dict(self.settings)
@@ -741,17 +929,52 @@ class Manager:
     # ---- helpers
 
     def _touch(self, job: dict, item: dict | None = None):
+        """Publish a change. With an item, only that item changed; without one, any item of the job may have."""
         with self.cond:
             job["rev"] += 1
             job["updated"] = time.time()
             if item is not None:
                 item["rev"] = job["rev"]
+                self._index(job, item)
+            else:
+                self._reindex(job)
+            self.version += 1
             self._dirty = True
+
+    # The scheduler's index: only queued and active items, so picking the next video and the dashboard
+    # don't scan every video of every playlist.
+
+    def _index(self, job: dict, item: dict):
+        key = (job["id"], item["id"])
+        if item["status"] in LIVE and self.jobs.get(job["id"]) is job:
+            if key not in self._live:
+                self._live[key] = (job, item)
+                self._order = None
+        elif self._live.pop(key, None):
+            self._order = None
+
+    def _reindex(self, job: dict):
+        for key in [k for k in self._live if k[0] == job["id"]]:
+            del self._live[key]
+        if self.jobs.get(job["id"]) is job:
+            for it in job["items"]:
+                if it["status"] in LIVE:
+                    self._live[(job["id"], it["id"])] = (job, it)
+        self._order = None
+
+    def _queue_order(self) -> list[tuple[dict, dict]]:
+        """Queued and active items in the order the scheduler picks them: priority, then playlist age and order."""
+        if self._order is None:
+            self._order = sorted(self._live.values(),
+                                 key=lambda p: (-(p[1].get("priority") or 0), p[0]["created"], p[1]["index"]))
+        return self._order
 
     def _set(self, job: dict, item: dict, **changes):
         """Change an item under the lock and publish the change."""
         with self.cond:
             item.update(changes)
+            if "priority" in changes:
+                self._order = None
             self._touch(job, item)
 
     def get(self, job_id: str) -> dict:
@@ -774,7 +997,7 @@ class Manager:
             "status": "new", "progress": 0.0, "speed": None, "eta": None,
             "downloaded": 0, "total": None, "error": None, "attempts": 0, "net_attempts": 0,
             "filepath": None, "next_try": 0, "rev": rev, "cancel": False,
-            "options": {}, "outdir": outdir, "log": [],
+            "options": {}, "outdir": outdir, "log": [], "priority": 0, "held": False, "history": [],
             "removed": bool(UNAVAILABLE_TITLE.match(it.get("title") or "")),
         }
 
@@ -806,6 +1029,13 @@ class Manager:
             if len(keep) != len(lines):
                 _atomic_write(path, "".join(line + "\n" for line in keep))
 
+    def _requeue(self, job: dict, item: dict, **changes):
+        """Put a video (back) in the queue. Every re-queue goes through here so a missing or damaged file is
+        always dropped from the archive first (otherwise the video would just be "skipped" again)."""
+        self._forget_file(job, item)
+        item.update(status="queued", error=None, attempts=0, net_attempts=0, next_try=0, cancel=False, held=False,
+                    **changes)
+
     def _forget_file(self, job: dict, item: dict):
         """Before re-downloading a video whose file was found missing or damaged, drop it from the archive."""
         if item.get("file_problem"):
@@ -833,6 +1063,7 @@ class Manager:
             until = time.time() + seconds
             if not self.hold or self.hold["until"] < until:
                 self.hold = {"reason": reason, "until": until}
+                self.version += 1
                 log.warning("Queue paused for %ds: %s", seconds, reason)
 
     def _wait_for_network(self) -> bool:
@@ -859,6 +1090,8 @@ class Manager:
                         if it["status"] == "queued" and it.get("net_attempts") and it["next_try"] > time.time():
                             it["next_try"] = 0
                 self.cond.notify_all()
+        with self.cond:
+            self.version += 1
 
     def waiting_reason(self) -> str | None:
         """Why queued videos aren't starting, if it's a queue-wide reason."""
@@ -1177,9 +1410,8 @@ class Manager:
                     continue
                 if wanted is None and it.get("removed") or wanted is not None and it["id"] not in wanted:
                     continue
-                self._forget_file(job, it)
-                it.update(status="queued", options=dict(options), outdir=outdir, error=None, attempts=0,
-                          net_attempts=0, next_try=0, cancel=False, progress=0.0, rev=job["rev"] + 1)
+                self._requeue(job, it, options=dict(options), outdir=outdir, progress=0.0, priority=0,
+                              rev=job["rev"] + 1)
                 count += 1
             self._touch(job)
             self.cond.notify_all()
@@ -1205,9 +1437,7 @@ class Manager:
                 self.hold = None
                 for it in job["items"]:
                     if it["status"] == "failed" or (it["status"] == "queued" and it["next_try"] > time.time()):
-                        self._forget_file(job, it)
-                        it.update(status="queued", error=None, attempts=0, net_attempts=0, next_try=0,
-                                  rev=job["rev"] + 1)
+                        self._requeue(job, it, rev=job["rev"] + 1)
             elif action == "remove":
                 for it in job["items"]:
                     it["cancel"] = True
@@ -1234,15 +1464,22 @@ class Manager:
                 elif item["status"] in ACTIVE:
                     item["cancel"] = True
             elif action == "retry" and item["status"] in ("failed", "queued"):
-                self._forget_file(job, item)
-                item.update(status="queued", error=None, attempts=0, net_attempts=0, next_try=0, cancel=False)
+                self._requeue(job, item)
             self._touch(job, item)
             self.cond.notify_all()
 
     def item_log(self, job_id: str, item_id: str) -> dict:
+        """Everything the detail views show about one video."""
         with self.cond:
-            item = self._get_item(self.get(job_id), item_id)
-            return {"title": item["title"], "error": item.get("error"), "lines": list(item.get("log") or [])}
+            job = self.get(job_id)
+            item = self._get_item(job, item_id)
+            options = item.get("options") or job["options"]
+            return {"title": item["title"], "error": item.get("error"), "lines": list(item.get("log") or []),
+                    "status": item["status"], "options": dict(options), "outdir": item.get("outdir") or job["outdir"],
+                    "filepath": item.get("filepath"), "fmt": item.get("fmt"), "step": item.get("step"),
+                    "history": list(item.get("history") or []), "attempts": item.get("attempts") or 0,
+                    "net_attempts": item.get("net_attempts") or 0, "started": item.get("started"),
+                    "finished": item.get("finished")}
 
     # ---- views
 
@@ -1289,7 +1526,7 @@ class Manager:
 
     def total_speed(self) -> float:
         with self.cond:
-            return sum(it.get("speed") or 0 for j in self.jobs.values() for it in j["items"] if it["status"] in ACTIVE)
+            return sum(it.get("speed") or 0 for _, it in self._live.values() if it["status"] in ACTIVE)
 
     def overview(self) -> dict:
         with self.cond:
@@ -1303,10 +1540,11 @@ class Manager:
             "settings": self.settings,
         }
 
-    def activity(self) -> dict:
+    def activity(self, job_id: str | None = None, q: str | None = None) -> dict:
         """Everything in flight across all playlists, for the dashboard: what is downloading, what is
         queued (in the order the scheduler will pick it) and what finished recently."""
         now = time.time()
+        q = (q or "").strip().lower()
         with self.cond:
             reason = self.waiting_reason()
             limit = self._limit()
@@ -1314,43 +1552,78 @@ class Manager:
             def row(job, it, **extra):
                 return {"job": job["id"], "job_title": job["title"], "id": it["id"], "title": it["title"],
                         "url": it.get("url"), "index": it.get("index"), "duration": it.get("duration"),
-                        "status": it["status"], "error": it.get("error"), **extra}
+                        "status": it["status"], "error": it.get("error"), "priority": it.get("priority") or 0,
+                        "held": bool(it.get("held")), **extra}
 
-            active, queue, recent = [], [], []
-            for job in sorted(self.jobs.values(), key=lambda j: j["created"]):   # scheduler order
-                for it in job["items"]:
-                    st = it["status"]
-                    if st in ACTIVE:
-                        active.append(row(job, it, progress=it.get("progress") or 0, speed=it.get("speed"),
-                                          eta=it.get("eta"), downloaded=it.get("downloaded"), total=it.get("total"),
-                                          started=it.get("started"),
-                                          attempts=(it.get("attempts") or 0) + (it.get("net_attempts") or 0)))
-                    elif st == "queued":
-                        if job["paused"]:
-                            wait = "Playlist paused"
-                        elif it.get("next_try", 0) > now:
-                            wait = f"Retry in {_fmt_secs(it['next_try'] - now)}"
-                        else:
-                            wait = reason or "Waiting for a free slot"
-                        queue.append(row(job, it, wait=wait, progress=it.get("progress") or 0,
-                                         retrying=it.get("next_try", 0) > now or bool(job["paused"])))
-                    elif st in ("done", "failed") and it.get("finished"):
-                        recent.append(row(job, it, finished=it["finished"], filepath=it.get("filepath")))
-            recent.sort(key=lambda r: -r["finished"])
-            day = [r for r in recent if now - r["finished"] < 86400]
-            return {
-                "active": active,
-                "queue": queue[:200], "queued": len(queue),
-                "recent": recent[:30],
-                "stats": {
-                    "active": len(active), "limit": limit, "concurrency": self.settings["concurrency"],
-                    "queued": len(queue), "ready": sum(not q["retrying"] for q in queue),
-                    "speed": sum(a["speed"] or 0 for a in active),
-                    "done_today": sum(r["status"] == "done" for r in day),
-                    "failed_today": sum(r["status"] == "failed" for r in day),
-                    "waiting": reason,
-                },
-            }
+            active, queue = [], []
+            for job, it in self._queue_order():
+                if job_id and job["id"] != job_id or q and q not in it["title"].lower() and q not in job["title"].lower():
+                    continue
+                st = it["status"]
+                if st in ACTIVE:
+                    active.append(row(job, it, progress=it.get("progress") or 0, speed=it.get("speed"),
+                                      eta=it.get("eta"), downloaded=it.get("downloaded"), total=it.get("total"),
+                                      started=it.get("started"), step=it.get("step"), fmt=it.get("fmt"),
+                                      attempts=(it.get("attempts") or 0) + (it.get("net_attempts") or 0)))
+                elif st == "queued":
+                    if it.get("held"):
+                        wait = "Paused"
+                    elif job["paused"]:
+                        wait = "Playlist paused"
+                    elif it.get("next_try", 0) > now:
+                        wait = f"Retry in {_fmt_secs(it['next_try'] - now)}"
+                    else:
+                        wait = reason or "Waiting for a free slot"
+                    queue.append(row(job, it, wait=wait, progress=it.get("progress") or 0,
+                                     next_try=it.get("next_try") or 0,
+                                     retrying=it.get("next_try", 0) > now or bool(job["paused"]) or bool(it.get("held"))))
+            speed_hist = list(self.speed_hist)
+            jobs = [{"id": j["id"], "title": j["title"]} for j in sorted(self.jobs.values(), key=lambda j: j["title"].lower())]
+            hold = dict(self.hold) if self.hold and now < self.hold["until"] else None
+        recent = self.history(limit=30)["rows"]
+        day = self.store.counts_since(now - 86400)
+        return {
+            "active": active,
+            "queue": queue[:200], "queued": len(queue),
+            "recent": recent,
+            "jobs": jobs,
+            "last_event": self.last_event,
+            "stats": {
+                "active": len(active), "limit": limit, "concurrency": self.settings["concurrency"],
+                "queued": len(queue), "ready": sum(not q["retrying"] for q in queue),
+                "speed": sum(a["speed"] or 0 for a in active),
+                "speed_history": speed_hist[-60:],
+                "done_today": day.get("done", 0),
+                "failed_today": day.get("failed", 0),
+                "waiting": reason,
+                "hold": hold,
+            },
+        }
+
+    def history(self, offset: int = 0, limit: int = 30, since_id: int = 0) -> dict:
+        """Finished and failed downloads from the event log, newest first, each with the video's status now
+        (so the page only offers Retry while the video is still failed)."""
+        rows = self.store.events(offset, limit, since_id)
+        with self.cond:
+            by_job: dict[str, dict] = {}
+            for r in rows:
+                job = self.jobs.get(r["job_id"])
+                if job and r["job_id"] not in by_job:
+                    by_job[r["job_id"]] = {it["id"]: it for it in job["items"]}
+                it = by_job.get(r["job_id"], {}).get(r["item_id"])
+                r.update(event=r.pop("id"), job=r.pop("job_id"), id=r.pop("item_id"), finished=r.pop("time"),
+                         current=it["status"] if it else None, current_file=it.get("filepath") if it else None)
+        return {"rows": rows, "total": self.store.count_events(), "last_id": self.last_event}
+
+    def clear_history(self) -> int:
+        n = self.store.hide_events()
+        with self.cond:
+            self.version += 1
+        return n
+
+    def stats(self, days: int = 30) -> dict:
+        days = max(1, min(int(days), 3650))
+        return self.store.stats(time.time() - days * 86400) | {"period": days}
 
     # ---- workers
 
@@ -1364,17 +1637,14 @@ class Manager:
         level = self.net_level() if self._wait_for_network() else "unknown"
         if level == "offline":
             return None
-        for job in sorted(self.jobs.values(), key=lambda j: j["created"]):
-            if job["paused"]:
+        for job, it in self._queue_order():
+            if job["paused"] or it["status"] != "queued" or it.get("held") or it["next_try"] > now:
                 continue
-            for it in job["items"]:
-                if it["status"] != "queued" or it["next_try"] > now:
-                    continue
-                if level == "blocked" and it["extractor"].lower().startswith("youtube"):
-                    continue
-                if self._flight_key(job, it) in self.inflight:   # same video, same folder: never twice at once
-                    continue
-                return job, it
+            if level == "blocked" and it["extractor"].lower().startswith("youtube"):
+                continue
+            if self._flight_key(job, it) in self.inflight:   # same video, same folder: never twice at once
+                continue
+            return job, it
         return None
 
     def _worker(self):
@@ -1390,7 +1660,7 @@ class Manager:
                 self.inflight.add(key)
                 if self.settings.get("sleep_between"):
                     self.next_start = time.time() + float(self.settings["sleep_between"])
-                item.update(status="downloading", speed=None, eta=None, started=time.time())
+                item.update(status="downloading", speed=None, eta=None, started=time.time(), step=None)
                 self.active += 1
                 self._touch(job, item)
             try:
@@ -1398,11 +1668,12 @@ class Manager:
             except Exception as exc:  # never let a worker die
                 log.exception("Unexpected error downloading %s", item["id"])
                 self._set(job, item, status="failed", error=_clean_error(exc), finished=time.time())
+                self._event(job, item, "failed", "other")
             finally:
                 with self.cond:
                     self.active -= 1
                     self.inflight.discard(key)
-                    item.update(speed=None, eta=None, cancel=False)
+                    item.update(speed=None, eta=None, cancel=False, step=None)
                     self._touch(job, item)
                     self.cond.notify_all()
 
@@ -1445,7 +1716,7 @@ class Manager:
         last = [0.0]
 
         def stopping() -> bool:
-            return item["cancel"] or job["paused"] or job["id"] not in self.jobs
+            return item["cancel"] or item.get("held") or job["paused"] or job["id"] not in self.jobs
 
         def progress_hook(d):
             if stopping():
@@ -1458,7 +1729,7 @@ class Manager:
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 done = d.get("downloaded_bytes") or 0
                 changes = dict(
-                    status="downloading",  # a before_dl postprocessor may have flagged "processing"
+                    status="downloading", step=None,  # a before_dl postprocessor may have flagged "processing"
                     downloaded=done, total=total, speed=d.get("speed"), eta=d.get("eta"),
                     progress=round(100 * done / total, 1) if total else item["progress"],
                 )
@@ -1466,9 +1737,15 @@ class Manager:
                     changes["error"] = None               # data is flowing again: clear the retry note
                 self._set(job, item, **changes)
 
+        remerge = [False]
+
         def pp_hook(d):
-            if d["status"] == "started" and item["status"] != "processing" and "Thumbnail" not in d.get("postprocessor", ""):
-                self._set(job, item, status="processing", progress=100.0, speed=None, eta=None)
+            name = d.get("postprocessor") or ""
+            if d["status"] != "started" or name.startswith("_") or name in PP_QUIET:
+                return
+            step = "Re-merging from kept streams" if remerge[0] and name == "Merger" else PP_STEPS.get(name, "Processing")
+            if item["status"] != "processing" or item.get("step") != step:
+                self._set(job, item, status="processing", progress=100.0, speed=None, eta=None, step=step)
 
         fmt_opts, pps = build_format_opts(options)
         prefix = f"{item['number']} - " if item["number"] and options.get("numbering", True) else ""
@@ -1502,14 +1779,17 @@ class Manager:
                     if options.get("metadata", True) and job["kind"] == "playlist":
                         ydl.add_post_processor(_PlaylistTags({"album": job["title"], "track": item["number"].lstrip("0")}),
                                                when="pre_process")
+                    ydl.add_post_processor(_FormatNote(lambda fmt: self._set(job, item, fmt=fmt)), when="before_dl")
                     info = ydl.extract_info(item["url"], download=True) or {}
                 filepath = ((info.get("requested_downloads") or [{}])[0].get("filepath")) or info.get("filepath")
                 parts = _part_files(outdir, item["id"])
+                self._set(job, item, status="processing", step="Checking stream sizes", speed=None, eta=None)
                 bad = _check_part_sizes(info, parts)
                 if bad:                                   # a stream itself is broken: get it again
                     _remove([filepath, *parts.values()] if filepath else parts.values())
                     raise _IncompleteFile(bad)
                 live = info.get("is_live") or info.get("was_live")
+                self._set(job, item, step="Verifying")
                 problem = _verify_file(filepath, None if live else (info.get("duration") or item.get("duration")))
                 if not problem:
                     break
@@ -1517,6 +1797,8 @@ class Manager:
                     os.remove(filepath)                   # so the next attempt makes it again
                 if attempt == 1 and parts:
                     self._item_log(job, item, "warning", f"{problem} — merging again from the downloaded streams")
+                    remerge[0] = True
+                    self._set(job, item, step="Re-merging from kept streams")
                     continue                              # yt-dlp reuses the streams on disk: no re-download
                 _remove(parts.values())
                 raise _IncompleteFile(problem)
@@ -1533,6 +1815,7 @@ class Manager:
             self._set(job, item, status="done", progress=100.0, filepath=filepath, error=None, finished=time.time(),
                       attempts=0, net_attempts=0, health="ok", checked=time.time(), file_problem=None)
             self._item_log(job, item, "info", f"Done and verified: {os.path.basename(filepath)}")
+            self._event(job, item, "done")
             with self.cond:
                 self.rate_strikes = 0
         except DownloadCancelled:
@@ -1585,8 +1868,13 @@ class Manager:
                     item.update(status="failed", error=msg)
             if item["status"] == "failed":
                 item["finished"] = now
+            item.setdefault("history", []).append({"t": now, "kind": kind, "msg": msg[:300],
+                                                   "result": item["status"]})
+            del item["history"][:-HISTORY_LEN]
             self._touch(job, item)
         self._item_log(job, item, "error", f"{kind} error → {item['status']}: {msg}")
+        if item["status"] == "failed":
+            self._event(job, item, "failed", kind)
         if kind == "network":
             self.on_network_error()
 
