@@ -1,0 +1,3 @@
+# Optional: the Mac app (window + menu-bar icon). ./run-mac.sh installs these; ./run.sh doesn't need them.
+-r requirements.txt
+pywebview==6.2.1
