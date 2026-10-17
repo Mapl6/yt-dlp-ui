@@ -2175,10 +2175,18 @@ class Manager:
                         "held": bool(it.get("held")), **extra}
 
             active, queue = [], []
+            # The totals (tiles) cover everything; the filter only narrows the lists.
+            totals = {"active": 0, "queued": 0, "ready": 0, "speed": 0.0}
             for job, it in self._queue_order():
+                st = it["status"]
+                if st in ACTIVE:
+                    totals["active"] += 1
+                    totals["speed"] += it.get("speed") or 0
+                elif st == "queued":
+                    totals["queued"] += 1
+                    totals["ready"] += not (it.get("next_try", 0) > now or job["paused"] or it.get("held"))
                 if job_id and job["id"] != job_id or q and q not in it["title"].lower() and q not in job["title"].lower():
                     continue
-                st = it["status"]
                 if st in ACTIVE:
                     active.append(row(job, it, progress=it.get("progress") or 0, speed=it.get("speed"),
                                       eta=it.get("eta"), downloaded=it.get("downloaded"), total=it.get("total"),
@@ -2219,9 +2227,9 @@ class Manager:
             "jobs": jobs,
             "last_event": self.last_event,
             "stats": {
-                "active": len(active), "limit": limit, "concurrency": self.settings["concurrency"],
-                "queued": len(queue), "ready": sum(not q["retrying"] for q in queue),
-                "speed": sum(a["speed"] or 0 for a in active),
+                "active": totals["active"], "limit": limit, "concurrency": self.settings["concurrency"],
+                "queued": totals["queued"], "ready": totals["ready"],
+                "speed": totals["speed"],
                 "speed_history": speed_hist[-60:],
                 "avg_speed": avg or None,
                 "left_bytes": left, "left_estimated": estimated,

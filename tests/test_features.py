@@ -181,6 +181,7 @@ j4 = make_job("four", ["c1", "c2"])
 mgr.queue(j4["id"], None, dict(OPTS))
 check("activity: filter by playlist", {r["id"] for r in mgr.activity(job_id=j4["id"])["queue"]} == {"c1", "c2"})
 check("activity: title search", [r["id"] for r in mgr.activity(q="video c2")["queue"]] == ["c2"])
+check("activity: totals ignore the filter", mgr.activity(q="no such title")["stats"]["queued"] == 2)
 mgr.action(j4["id"], "stop")
 
 # ---------- event log thread safety: many writers at once with the saver
