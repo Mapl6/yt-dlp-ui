@@ -90,6 +90,11 @@ Video titles link to YouTube. Playlist names jump to that playlist below. When t
 
 **Keyboard shortcuts:** `/` search playlists, `u` link box, `p` pause/resume all, `1`–`4` dashboard tabs, `s` settings, `?` list of shortcuts.
 
+**Your data** (at the bottom of Settings):
+
+- **Export all data** saves one `.json` file with your settings, every saved playlist with its videos (status, file numbers, file paths) and the download history. Use it as a backup or to move the library to another computer. The video files themselves aren't included.
+- **Import…** reads such a file, for example in a second copy of the app (another port and library) or on another computer. It never deletes or overwrites anything: unknown playlists are added, playlists you already have (same link) only gain the videos they lack, and history entries already there are skipped. Every video comes back in the state it had: downloaded, failed, not downloaded, or queued (queued videos continue downloading, and paused playlists stay paused). Then the app runs **Check files** on each imported playlist, one after another: it confirms the downloaded files are in their folders and play, picks up good files already in the folder, and marks missing ones as failed so you can press Retry. The app asks whether to use the file's settings too; by default yours are kept.
+
 ## Weak or unstable internet
 
 Downloads are built so that nothing is lost when the connection drops:

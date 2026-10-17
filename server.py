@@ -101,6 +101,11 @@ class SyncRequest(BaseModel):
     auto_download: bool = False
 
 
+class ImportRequest(BaseModel):
+    data: dict
+    settings: bool = False      # also replace the settings with the file's
+
+
 class OpenManyRequest(BaseModel):
     urls: list[str]
 
@@ -121,7 +126,10 @@ async def guard(request: Request, call_next):
         sent = request.query_params.get("token", "") if path == "/api/stream" else request.headers.get("x-token", "")
         if not secrets.compare_digest(sent, TOKEN):
             return JSONResponse({"detail": "Session expired — reload the page."}, status_code=403)
-    return await call_next(request)
+    response = await call_next(request)
+    if path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"   # always revalidate: an update must never run old code
+    return response
 
 
 LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -175,6 +183,9 @@ async def login(request: Request):
 def index():
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     html = html.replace('<meta name="api-token" content="">', f'<meta name="api-token" content="{TOKEN}">')
+    for name in ("js/main.js", "style.css"):          # a new file name after every change: no stale cached copy
+        if (STATIC / name).exists():
+            html = html.replace(f'"/static/{name}"', f'"/static/{name}?v={int((STATIC / name).stat().st_mtime)}"')
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
@@ -260,6 +271,22 @@ def settings(patch: dict):
     result = manager.update_settings(patch)
     net.check_now()   # a new proxy changes reachability right away
     return result
+
+
+@app.get("/api/export")
+def export_all():
+    """Everything in one JSON file: settings, every playlist with its videos, and the download history."""
+    name = time.strftime("yt-downloader-export-%Y%m%d-%H%M%S.json")
+    return JSONResponse(manager.export_data(), headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@app.post("/api/import")
+def import_all(req: ImportRequest):
+    """Merge an export file into the library (adds what is missing, never deletes)."""
+    try:
+        return manager.import_data(req.data, req.settings)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.post("/api/open")

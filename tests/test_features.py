@@ -541,6 +541,89 @@ check("backfill: earlier download added, dated by its file", len(rows) == 1 and 
       and int(rows[0]["finished"]) == 1_700_000_000 and rows[0]["bytes"] == len(GOOD), rows)
 check("backfill: done once (version recorded)", m2.store.version == 1)
 
+# ---------- export all data, import it into another library (merge, never delete)
+data = json.loads(json.dumps(mgr.export_data()))          # must survive JSON
+n_items = sum(len(j["items"]) for j in mgr.jobs.values())
+check("export: every playlist, video and event", len(data["jobs"]) == len(mgr.jobs)
+      and sum(len(j["items"]) for j in data["jobs"]) == n_items
+      and len(data["events"]) == mgr.store.count_events(hidden=True) > 0, (len(data["jobs"]), len(data["events"])))
+check("export: settings, marker, no runtime fields", data["app"] == M.EXPORT_APP and data["format"] == M.EXPORT_FORMAT
+      and data["settings"]["output_dir"] == str(out)
+      and not any(k in it for j in data["jobs"] for it in j["items"] for k in M.TRANSIENT))
+check("export: summary per playlist", all(j["summary"]["videos"] == len(j["items"]) for j in data["jobs"])
+      and sum(j["summary"]["downloaded"] for j in data["jobs"])
+      == sum(it["status"] in ("done", "skipped") for j in data["jobs"] for it in j["items"]
+             if not (it.get("removed") and it["status"] in ("new", "failed"))))
+m2_out = m2.settings["output_dir"]
+done_before = sum(it["status"] == "done" for it in m2.jobs["oldjob"]["items"])   # oldjob is a copy of j3's playlist
+r = m2.import_data(data, check_files=False)
+check("import data: playlists, videos and history added", r["playlists_added"] == len(mgr.jobs) - 1
+      and r["playlists_merged"] == 1 and r["videos_added"] == n_items and r["events_added"] == len(data["events"])
+      and r["skipped"] == 0, r)
+check("import data: the same playlist is merged, not duplicated", "oldjob" in m2.jobs and j3["id"] not in m2.jobs
+      and set(items_of(j3)) <= set(items_of(m2.jobs["oldjob"])))
+check("import data: settings kept unless asked", not r["settings"] and m2.settings["output_dir"] == m2_out)
+def expected(st):
+    return "queued" if st in M.ACTIVE else st
+got = {it["id"]: it["status"] for j in m2.jobs.values() for it in j["items"]}
+check("import data: every video keeps its state (interrupted ones queued again)",
+      all(got[it["id"]] == expected(it["status"]) or (it["status"] == "new" and got[it["id"]] == "skipped")
+          for j in data["jobs"] for it in j["items"]), [(it["id"], it["status"], got[it["id"]]) for j in data["jobs"]
+                                                       for it in j["items"] if got[it["id"]] != expected(it["status"])])
+check("import data: queued videos are in the scheduler", {k[1] for k in m2._live}
+      == {i for i, st in got.items() if st in M.LIVE})
+check("import data: done videos stay done", sum(it["status"] == "done" for j in m2.jobs.values() for it in j["items"])
+      == sum(it["status"] == "done" for j in mgr.jobs.values() for it in j["items"]) + done_before > 0)
+check("import data: saved to the database", len(m2.store.load()) == len(m2.jobs) == len(mgr.jobs)
+      and sum(len(j["items"]) for j in m2.store.load()) == n_items + 1)
+r = m2.import_data(data, check_files=False)
+check("import data: twice adds nothing", r["playlists_added"] == 0 and r["playlists_merged"] == len(mgr.jobs)
+      and r["videos_added"] == 0 and r["events_added"] == 0, r)
+src = next(j for j in data["jobs"] if j["kind"] == "playlist" and j["items"] and j["id"] != j3["id"])
+local = m2.jobs[src["id"]]
+local_numbers = {it["number"] for it in local["items"]}
+extra = dict(src["items"][0], id="extra1", title="Extra", status="queued")   # same file number as a known video
+r = m2.import_data(data | {"jobs": [src | {"items": src["items"] + [extra]}], "events": []}, check_files=False)
+new = items_of(local).get("extra1")
+check("import data: merge adds only the missing video", r["videos_added"] == 1 and r["playlists_merged"] == 1 and new, r)
+check("import data: merged video gets a free number, goes last, keeps its state",
+      new and new["number"] not in local_numbers and new["index"] == max(it["index"] for it in local["items"])
+      and new["status"] == "queued", new and (new["number"], local_numbers, new["status"]))
+r = m2.import_data(data | {"jobs": [], "events": [], "settings": data["settings"] | {"concurrency": 5}}, True, False)
+check("import data: settings when asked", r["settings"] and m2.settings["concurrency"] == 5, r)
+for bad, why in (({"app": "other", "jobs": []}, "a foreign file"), (data | {"format": 99}, "a newer format"),
+                 ([1, 2], "a non-object")):
+    try:
+        m2.import_data(bad)
+        check(f"import data: refuses {why}", False)
+    except ValueError:
+        check(f"import data: refuses {why}", True)
+r = m2.import_data(data | {"jobs": [{"id": "x"}, src | {"id": "new-id", "url": "test://other", "source_id": "other",
+                                                      "items": [{"id": "y"}, *src["items"]]}], "events": []},
+                   check_files=False)
+check("import data: bad entries skipped, the rest kept", r["skipped"] == 2 and r["playlists_added"] == 1
+      and r["videos_added"] == len(src["items"]), r)
+# the folder of an imported playlist is checked: good files found, recorded files confirmed, missing ones flagged
+fold = TMP / "imported"; fold.mkdir()
+(fold / "Here [have1].mp4").write_bytes(GOOD)
+(fold / "Kept [kept1].mp4").write_bytes(GOOD)
+vid = lambda i, **k: {"index": i, "id": k.pop("id"), "title": "T", "extractor": "Test", "duration": 30,
+                      "url": "test://x", **k}
+r = m2.import_data({"app": M.EXPORT_APP, "format": 1, "jobs": [{
+    "id": "folderjob", "url": "test://folder", "source_id": "folder", "title": "Folder", "kind": "playlist",
+    "outdir": str(fold), "items": [vid(1, id="have1", status="new"),
+                                   vid(2, id="kept1", status="done", filepath=str(fold / "Kept [kept1].mp4")),
+                                   vid(3, id="gone1", status="done", filepath=str(fold / "Gone [gone1].mp4")),
+                                   vid(4, id="todo1", status="new")]}]})
+fj = m2.jobs["folderjob"]
+check("import data: folders checked after import", r["checking"] == 1
+      and wait(lambda: (fj.get("check") or {}).get("finished"), 60), fj.get("check"))
+fi = items_of(fj)
+check("import data: check finds files, confirms done ones, flags missing ones",
+      fi["have1"]["status"] == "skipped" and fi["kept1"]["status"] == "done" and fi["kept1"]["health"] == "ok"
+      and fi["gone1"]["status"] == "failed" and fi["gone1"].get("file_problem") and fi["todo1"]["status"] == "new",
+      {k: (v["status"], v.get("file_problem")) for k, v in fi.items()})
+
 srv.shutdown()
 print("\nALL PASSED" if ok else "\nSOME FAILED")
 sys.exit(0 if ok else 1)

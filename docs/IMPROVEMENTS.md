@@ -55,6 +55,10 @@ The roadmap from 2026-10-16, apart from Docker and the browser extension. Five c
 - Per-video Show in Finder, Play, Delete file, Mark as downloaded; remove a playlist together with its files; export `.m3u8`.
 - yt-dlp version check, **Update now** and **Restart now**.
 
+### Export and import all data
+
+- Settings → **Export all data** / **Import…**: one JSON file with settings, every playlist and video, and the event log. Import merges (adds missing playlists, videos and history; never deletes), keeps every video's state (queued ones continue), runs Check files on the imported playlists one at a time, and only applies the file's settings when the user agrees. The page gets `?v=<mtime>` on its scripts and `/static/*` is served `no-cache`, so an update never runs stale JavaScript. `GET /api/export`, `POST /api/import`; checks in `tests/test_features.py`.
+
 ### Platform and code quality
 
 - Live updates over Server-Sent Events (`/api/stream`), polling as a fallback. `/api/activity` and the scheduler read an index of queued and active videos instead of scanning every video.
