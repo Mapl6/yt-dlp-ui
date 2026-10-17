@@ -5,18 +5,25 @@ A local web app for downloading YouTube videos, playlists, and channels with yt-
 ## Start
 
 ```bash
-./run.sh            # opens http://127.0.0.1:8765
+./run.sh            # opens http://127.0.0.1:8765 in your browser
+./run-mac.sh        # optional: the same app in its own Mac window, with a menu-bar icon
+run.bat             # Windows (or: powershell -ExecutionPolicy Bypass -File run.ps1)
 ```
 
 Requires Python 3.10+, `ffmpeg` (`brew install ffmpeg`), and a JS runtime — deno is recommended (`brew install deno`); node or bun also work.
 
+**Mac app (optional).** `./run-mac.sh` installs pywebview and opens the downloader in its own window. Closing the window only hides it: downloads continue, the menu-bar icon (⇣ with the number of downloads) brings it back, pauses or resumes everything, opens the download folder, or quits. `scripts/make_mac_app.sh` builds `dist/YT Downloader.app`, a small launcher you can put in Applications or the Dock (keep the project folder where it is).
+
 ## How it works
 
 1. **Paste a playlist link and press Add.** The whole playlist (every video) is saved to your library. Nothing downloads yet.
-2. **Open the playlist and choose videos:** tick them, use *Select not downloaded*, type a range like `1-50, 80, 100-`, or filter by title.
-3. **Pick a quality and press Download.** Each video shows its state: Not downloaded → Queued → Downloading → Downloaded.
+2. **Open the playlist and choose videos:** tick them, use *Select not downloaded*, type a range like `1-50, 80, 100-`, filter by title or length, or sort by title, length, status or download date. Playlists with thousands of videos stay fast: only the rows on screen are drawn.
+3. **Pick a quality and press Download.** Next to the button you see the estimated size of the selection and the free space on that drive. Each video shows its state: Not downloaded → Queued → Downloading → Processing (merging, verifying…) → Downloaded.
 4. **Come back any time.** The library and every video's progress are saved in `data/library.db` (an older `data/state.json` is moved in automatically on first start). Close the app, restart the Mac, add more videos later; the playlist keeps track.
 5. **Add the same link again** (or press *Check for new videos*) to pull in videos added to the playlist since. Everything you already have stays marked as downloaded. The list follows the playlist's new order, but files keep their numbers, and new videos get the next free number. Videos that left the playlist or became private/deleted are marked **Unavailable** and are skipped by *Select not downloaded*.
+6. **Let it check by itself.** In an opened playlist, *Check for new videos* can run every 6 or 12 hours, daily or weekly, and *Download new videos automatically* queues what it finds with the playlist's last options (a paused playlist stays paused). Checks wait while you're offline.
+
+To add many links at once, paste them all into the link box (one per line or separated by spaces) or press **Import .txt** and pick a text file; they are added one after another and the progress shows under the box.
 
 ## Features
 
@@ -26,7 +33,12 @@ Requires Python 3.10+, `ffmpeg` (`brew install ffmpeg`), and a JS runtime — de
 - Half-finished downloads continue where they stopped, even after a restart
 - Videos already in the folder (from its `.downloaded.txt` archive) are marked as downloaded automatically
 - **Automatic retries** with backoff for network errors; private or deleted videos fail right away with a clear reason
-- Embeds the thumbnail (as the cover inside the video file, with no separate image left next to it), metadata (title, channel, date, description, link, and for playlists the playlist name as album and the video number as track), chapters, and (optionally) English subtitles
+- Embeds the thumbnail (as the cover inside the video file, with no separate image left next to it), metadata (title, channel, date, description, link, and for playlists the playlist name as album and the video number as track), chapters, and (optionally) subtitles in the languages you choose (`en, fa`, or `all`), including YouTube's auto-generated ones if you tick that
+- **Sponsor segments** ([SponsorBlock](https://sponsor.ajay.app)): keep them, mark them as chapters, or cut them out (sponsors, self-promotion, "subscribe" reminders). If SponsorBlock can't be reached, the video downloads without cuts instead of failing.
+- **Only part of a video:** give a start and/or end (`1:30`, `1:02:03` or seconds). The part is saved as its own file, e.g. `Title (1-30–2-45) [id].mp4`, and doesn't count as the whole video being downloaded.
+- **Per-video actions** (the ⋯ menu on a row): Show in Finder, Play, Delete file (it goes back to "Not downloaded"), Mark as downloaded, Move to the top or bottom of the queue, Pause just this video, Try now
+- **Export .m3u** writes a playlist file of the downloaded videos, in playlist order, into the playlist's folder
+- **Remove** a playlist from the library and, if you tick the box, delete its downloaded files too (only files with one of its video ids in the name; a video another saved playlist in the same folder still has is kept)
 - **Check files** (inside an opened playlist) verifies every downloaded video, including ones downloaded long ago. Damaged files are renamed to `….damaged` and missing ones are flagged; both go to the *Failed* tab, where *Retry* downloads them again. Good files already in the folder that the app didn't know about are marked as downloaded.
 - **Clean up leftovers** deletes partial downloads, unmerged streams, `….damaged` files and thumbnail images whose picture is already inside the video, of a playlist, after showing you the list. Videos in the queue are never touched.
 - **Details** button on any video with a problem shows what happened; the full log is in `data/app.log`
@@ -47,14 +59,19 @@ It also shows response times, stability, live download speed, and a chart of rec
 
 ## Activity dashboard
 
-The **Activity** panel shows every playlist at once:
+The **Activity** panel shows every playlist at once. It updates live (the server pushes changes) and folds away when nothing is downloading or queued; the arrow opens or closes it, and your choice is remembered.
 
-- **Totals:** how many videos are downloading (and the current limit, which drops on a weak connection), how many are queued (ready vs. waiting for a retry or a paused playlist), total speed with the data left in the current videos, and how many finished or failed in the last 24 hours.
-- **Downloading now:** each video's playlist, progress, size, speed, time left, when it started and which attempt this is. ✕ stops it.
-- **Up next:** the queue in the order videos will start, with why each one is waiting ("Waiting for a free slot", "Retry in 0:40", "Playlist paused", offline…) and its last error. ✕ removes it from the queue.
-- **Recently finished:** the last 30 videos that were downloaded or failed, with the file name or error. Failed ones can be retried here.
+- **Totals:** videos downloading (and the current limit, which drops on a weak connection), queued (ready vs. waiting), total speed, **time left** for the whole queue (from the data still to download and the speed of the last two minutes; sizes not known yet are estimated from each video's length and quality), how many finished or failed in the last 24 hours, and **free disk space** on the drive the queue saves to, with a warning before it gets low enough to pause the queue.
+- A **speed chart** of the last two minutes; hover it for the speed at any moment.
+- **Pause all / Resume all** for every playlist at once (or press `p`).
+- **Downloading now:** each video's progress, size, speed, time left, when it started and which attempt this is, and what it is doing once downloaded (Merging, Verifying, Embedding thumbnail, Re-merging from kept streams…). Pause or stop each one.
+- **Up next:** the queue in the order videos will start, with why each one is waiting. **Drag** a row to reorder the queue, or use the arrows to move a video to the top or bottom. Pause one video without touching the rest, and **Try now** skips the wait before a retry.
+- **Recently finished:** every download that finished or failed, newest first, from a history that keeps them even if a video is retried later (videos downloaded before this existed are added once, dated by their files). Show in Finder, Play, Retry, **Retry all failed**, **Show more**, and **Clear** (clears the list, not the statistics).
+- **History & stats:** data downloaded per day or week (7 days to a year), success rate, average speed and the most common reasons downloads failed. Hover a column for its numbers, or switch to a table.
+- Click a row (or its arrow) for the details: the chosen and the actual format, folder and file name, every attempt with its kind of error, and the log.
+- Filter the lists by playlist or search titles.
 
-Video titles link to YouTube. Playlist names jump to that playlist below.
+Video titles link to YouTube. Playlist names jump to that playlist below. When the whole queue is paused (rate limiting, disk full), the banner has a **Try now** button for when you have fixed the cause. The browser tab shows the progress (`↓3 · 42% — YT Downloader`), and Settings can turn on **desktop notifications** when a playlist finishes or a video fails.
 
 ## Settings (⚙)
 
@@ -65,6 +82,13 @@ Video titles link to YouTube. Playlist names jump to that playlist below.
 | Proxy | `socks5://127.0.0.1:1080` etc., if YouTube is blocked on your network |
 | Pause between videos | 2–5 s helps with playlists of hundreds of videos |
 | Wait while offline | On by default: the queue pauses while offline and uses fewer parallel downloads on a weak connection |
+| Speed limit per download / total | The total limit is shared by the downloads running at the moment |
+| Download schedule | Only start downloads between two times (e.g. 01:00–07:00, also across midnight). A video already downloading finishes |
+| Subtitle languages | The default for new downloads |
+| Desktop notifications | When a playlist finishes downloading or a video fails |
+| yt-dlp | Shows the version in use and whether a newer one exists. **Update now** installs it; **Restart now** restarts the app to use it (interrupted downloads continue) |
+
+**Keyboard shortcuts:** `/` search playlists, `u` link box, `p` pause/resume all, `1`–`4` dashboard tabs, `s` settings, `?` list of shortcuts.
 
 ## Weak or unstable internet
 
@@ -78,10 +102,12 @@ Downloads are built so that nothing is lost when the connection drops:
 - **Safe library.** The library is a SQLite database that survives crashes and power loss, and each save writes only what changed. A backup is made every 10 minutes; a damaged database is kept aside and the backup is loaded.
 - **No double downloads.** Only one copy of the app can use a library, and a video locked by another copy (for example, a second library saving to the same folder) waits instead of writing the same file twice.
 
-Run the tests (no internet needed): `.venv/bin/python tests/test_core.py` and `.venv/bin/python tests/test_reliability.py`
+Run the tests (no internet needed): `tests/test_core.py`, `tests/test_reliability.py`, `tests/test_health.py` and `tests/test_features.py` with `.venv/bin/python`, and `node tests/test_ui.mjs` for the page.
 
 ## Security
 
-The app only answers requests addressed to `127.0.0.1` or `localhost`, and every API call needs a token that is built into the page at startup. Other websites you visit can't control it. If you start it with `--host 0.0.0.0` to use it from another device, anyone on your network can use it.
+The app only answers requests addressed to `127.0.0.1` or `localhost`, and every API call needs a token that is built into the page at startup. Other websites you visit can't control it.
+
+To use it from another device, start it with `--host 0.0.0.0` **and a password**: `YTDL_PASSWORD=… ./run.sh --host 0.0.0.0` (or `--password …`; the environment variable keeps it out of the process list). Every browser then has to log in once; five wrong passwords in a minute lock that address out for a minute. Without a password, anyone on your network can use it, and the app warns you when it starts.
 
 Only download content you have the right to download.

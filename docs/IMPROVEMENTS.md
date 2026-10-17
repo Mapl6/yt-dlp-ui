@@ -1,101 +1,69 @@
 # YT Downloader — Improvement Plan
 
-Last updated 2026-10-16. Open work first; finished work is summarized at the end.
+Last updated 2026-10-17. Open work first; finished work is summarized at the end.
 
 ## Next up
 
-1. **Subscriptions / auto-sync:** check saved playlists every N hours, with optional auto-download of new videos.
-2. **SponsorBlock:** remove sponsor segments.
-3. **Subtitle languages:** choose languages, including auto-generated subtitles (English is hard-coded today).
-4. **Desktop notification** when a playlist finishes.
-
-## Activity dashboard: next steps
-
-The dashboard (Activity panel) shows what's downloading, the queue and recent results. Planned additions:
-
-### Queue control
-
-- **Reorder the queue:** "Move to top" / "Move to bottom" per video, and drag to reorder. Today `_next_item` picks by playlist creation date and then playlist order. This needs a `priority` field that the scheduler sorts by first.
-- **Pause / resume one video** without removing it from the queue (today only the whole playlist can be paused).
-- **Pause all / Resume all** buttons in the dashboard header.
-- **"Try now"** for a video waiting on a retry: clears its `next_try`. Also a "Try now" on the queue-wide hold banner (rate limit, disk full) for when the user has fixed the cause.
-- **Retry all failed** across every playlist, from the "Recently finished" tab.
-
-### More detail
-
-- **Expandable row** per video, showing:
-  - chosen format and resolution;
-  - output folder and file name;
-  - each attempt with its error kind (network, rate limit, other);
-  - the log lines inline, instead of in the Details dialog.
-- **Processing sub-step:** "Merging", "Verifying", "Embedding thumbnail", "Re-merging from kept streams" instead of only "Processing".
-- **Time left for the whole queue:** estimated from known sizes (or duration × bitrate for the chosen quality) and the recent average speed.
-- **Disk tile:** free space on each target drive next to the estimated size of the queue, warning before the 1 GB low-disk hold kicks in.
-- **Speed chart:** total download speed over the last few minutes, like the connection panel's response-time chart.
-- **Per-playlist filter** and title search in the dashboard lists.
-
-### History
-
-- **Real event log:** a SQLite table of finished and failed downloads, with time, size and duration.
-  - "Recently finished" is built from each video's current status, so a video re-queued or retried disappears from it.
-  - Videos downloaded before the dashboard existed have no `finished` time, so they never appear in it.
-- **Stats from the log:**
-  - GB downloaded per day or week;
-  - success rate;
-  - average speed;
-  - most common error kinds.
-
-  This would cover the "History and stats page" idea below.
-- **Clear** button and "show more" paging for "Recently finished" (it shows the last 30 today).
-- **Actions on finished rows:** Reveal in Finder, Play.
-
-### Polish
-
-- **Browser tab title shows progress,** e.g. "↓3 · 42% — YT Downloader", so it's visible from another tab.
-- **Desktop notification when a video fails permanently,** not only when a playlist finishes.
-- **Collapse the dashboard** when nothing is queued, remembered per browser.
-- **Faster `/api/activity`:** it scans every item of every playlist each second. Keep running counters, or push changes with SSE (see Performance below).
+1. **Docker image** for a home server or NAS. The network-mode password it needed now exists (`--password` / `YTDL_PASSWORD`).
+2. **Browser extension or bookmarklet:** "Send to YT Downloader" from a YouTube page (it can post to `/api/open-many`).
 
 ## Open issues
 
 | Issue | Fix |
 | --- | --- |
-| **Network mode is unprotected.** With `--host 0.0.0.0`, anyone on the network can use the app (it prints a warning). | Optional password for network mode. |
-| **The page's code has no tests.** That includes the range selector (`1-50, 80`), tabs and selection. | Small JS test file, run with Node. |
-| **Possible false "damaged" result.** "Check files" marks a file as damaged if `ffprobe` can't open it. The file is only renamed to `.damaged`, never deleted. | Before renaming, re-check with a full decode. |
+| **Windows is untested.** `run.bat`, `run.ps1` and the `msvcrt` file locks were only checked for syntax on macOS. | Run the test suites on a Windows machine. |
+| **The Mac app's menu-bar icon is only checked by hand.** `mac_app.py --smoke` covers the window, the page and creating the icon, not clicking its menu. | A UI test with the Accessibility API, or keep checking by hand after changes. |
+| **The total speed limit is per connection.** A fragmented stream (HLS/DASH) downloads 4 fragments at once, each allowed the full share, so it can briefly go over the total. | Divide the share by `concurrent_fragment_downloads` for fragmented formats. |
+| **Logins don't survive a restart.** Password sessions are kept in memory, so after a restart (or a yt-dlp update) every browser logs in again. | Signed session cookies with a key stored in `data/`. |
+| **Long errors are cut to one line in the playlist list** (rows have a fixed height for virtual scrolling). The full text is in the tooltip and in Details. | An expandable row, like the dashboard's. |
 
-## Performance and code quality
+## Ideas
 
-- Replace the 1-second polling with Server-Sent Events (push only when `rev` changes).
-- `_next_item` scans every item while holding the lock; use a ready-queue.
-- Draw only the visible rows (virtual scrolling) for playlists with 2,000+ videos.
-- Pin `fastapi`/`uvicorn` versions; keep only `yt-dlp` unpinned.
-- Add `run.bat`/`run.ps1` for Windows. File locks are skipped on Windows today.
-- Split `app.js` into modules: api, library, netpanel, settings.
+- Per-playlist schedule and speed limit (today both are global).
+- Notifications for queue-wide pauses (rate limiting, disk full), not only finished playlists and failed videos.
+- A "Downloaded" badge on the Mac app's Dock icon.
 
-## Feature ideas
+## Done (2026-10-17)
 
-### Low effort (yt-dlp already supports these)
+The roadmap from 2026-10-16, apart from Docker and the browser extension. Five commits on `feature/roadmap`: core, queue control, download options, server, front end; plus the Mac app and these docs.
 
-- Download only part of a video (`download_ranges`).
-- Paste many links at once, or import a `.txt` file of URLs.
-- Show the yt-dlp version with an "Update now" button.
+### Queue control
 
-### Medium effort
+- Move a video to the top or bottom of the queue, or drag it in the dashboard (`priority`, then playlist age and order).
+- Pause and resume one video (`held`); a running one stops and keeps its `.part` file.
+- **Try now** for a video waiting on a retry, and on the queue-wide pause banner.
+- **Pause all / Resume all**, **Retry all failed**.
 
-- Download schedule (e.g. only 1–7 am) and a total speed limit across all downloads.
-- Estimated total size before queueing (the queue already pauses below 1 GB free).
-- Actions on downloaded videos: Reveal in Finder, Play, Delete file, Mark as downloaded.
-- Export a playlist as `.m3u`.
-- Sort and filter by duration, date or status; keyboard shortcuts.
-- History and stats page.
-- Option to delete files when removing a playlist.
+### Dashboard and history
 
-### Bigger
+- Event log (SQLite `events` table) of finished and failed downloads with size and time; earlier downloads are added once from their files. "Recently finished" reads it, with paging and **Clear** (hides rows; stats keep them).
+- **History & stats** tab: data per day or week, success rate, average speed, most common error kinds, with a table view.
+- Tiles for time left (queue size from known sizes or duration × bitrate, and the last two minutes' speed) and free disk space per drive; a speed chart.
+- Expandable rows: chosen and actual format, folder and file, attempts with error kinds, and the log.
+- Processing sub-steps (Merging, Verifying, Embedding thumbnail, Re-merging…).
+- Filter by playlist and search; totals ignore the filter. The panel folds away when idle.
+- Tab title progress, desktop notifications (finished playlist, failed video), keyboard shortcuts.
 
-- Browser extension or bookmarklet: "Send to YT Downloader".
-- Standalone Mac app (pywebview + menu bar).
-- Docker image for a home server or NAS (needs the network-mode password first).
+### Downloads and library
+
+- Subscriptions: check saved playlists every 6/12/24 h or weekly, optionally queueing new videos.
+- SponsorBlock: mark or cut segments; a SponsorBlock outage never fails a download.
+- Subtitle languages, including auto-generated ones.
+- Download only part of a video (own file name, never archived). Cut and partial files are verified against their real length (`media_duration`), also by Check files.
+- Paste many links or import a `.txt` file; estimated size and free space before queueing.
+- Download schedule and a total speed limit shared by running downloads (applied to downloads in progress).
+- Per-video Show in Finder, Play, Delete file, Mark as downloaded; remove a playlist together with its files; export `.m3u8`.
+- yt-dlp version check, **Update now** and **Restart now**.
+
+### Platform and code quality
+
+- Live updates over Server-Sent Events (`/api/stream`), polling as a fallback. `/api/activity` and the scheduler read an index of queued and active videos instead of scanning every video.
+- Virtual scrolling in playlist cards; `app.js` split into ES modules under `static/js/` (no build step).
+- Check files decodes a file fully before calling it damaged.
+- Optional password for network mode (login page, session cookie, rate limit).
+- `fastapi` and `uvicorn` pinned; `run.bat` / `run.ps1`; file locks on Windows.
+- Optional Mac app: `mac_app.py`, `run-mac.sh`, `scripts/make_mac_app.sh`.
+- Tests: `tests/test_features.py` (Python) and `tests/test_ui.mjs` (page logic, run with Node), next to the three existing suites.
 
 ## Done (2026-10-16)
 
@@ -136,4 +104,3 @@ The dashboard (Activity panel) shows what's downloading, the queue and recent re
 - `data/app.log` (rotating) plus a **Details** button per video.
 - Only one copy of the app can use a library; it refuses to start if its port is taken; a per-video lock stops two copies from writing the same file.
 
-**Tests:** `tests/test_core.py`, `tests/test_reliability.py`, `tests/test_health.py` — 109 checks, no internet needed.
