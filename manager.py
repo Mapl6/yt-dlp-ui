@@ -22,8 +22,12 @@ from pathlib import Path
 
 try:
     import fcntl                                   # POSIX file locks (macOS / Linux)
-except ImportError:                                # Windows: locks are skipped
+except ImportError:
     fcntl = None
+try:
+    import msvcrt                                  # Windows file locks
+except ImportError:
+    msvcrt = None
 
 import yt_dlp
 from yt_dlp.networking.exceptions import HTTPError, TransportError
@@ -57,7 +61,12 @@ DEFAULT_SETTINGS = {
     "sleep_between": 0.0,        # seconds between starting downloads (helps avoid 429s)
     "proxy": "",                 # e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080
     "wait_for_network": True,    # hold the queue while offline, slow down on a weak connection
+    "total_rate_mb": 0.0,        # shared by all downloads, 0 = unlimited
+    "schedule_on": False,        # only start downloads between schedule_start and schedule_end (local time)
+    "schedule_start": "01:00",
+    "schedule_end": "07:00",
 }
+HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 VIDEO_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
 AUDIO_FORMATS = {"mp3", "m4a", "opus"}
@@ -204,7 +213,15 @@ def _coerce_settings(raw: dict) -> dict:
         out[key] = value
     out["concurrency"] = max(1, min(MAX_WORKERS, out["concurrency"]))
     out["output_dir"] = out["output_dir"] or DEFAULT_SETTINGS["output_dir"]
+    for key in ("schedule_start", "schedule_end"):
+        m = HHMM.match(out[key])
+        out[key] = f"{int(m.group(1)):02d}:{m.group(2)}" if m else DEFAULT_SETTINGS[key]
     return out
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
 
 
 def _retry_sleep(n: int) -> float:
@@ -226,6 +243,27 @@ def _folder_problem(outdir: str) -> str | None:
     return None
 
 
+DAMAGED = "The downloaded file is damaged"
+
+
+def _decodes_fully(path: str, duration: float | None) -> bool:
+    """Second opinion before calling a file damaged: decode all of it. True only if ffmpeg reads it to the
+    end without a single error (and, when the length is known, reaches at least 97% of it)."""
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        res = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:V?", "-map", "0:a?",
+                              "-f", "null", "-", "-progress", "pipe:1", "-nostats"],
+                             capture_output=True, text=True, timeout=min(3600, max(300, 2 * (duration or 600))))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if res.returncode != 0 or res.stderr.strip():
+        return False
+    times = re.findall(r"out_time_us=(\d+)", res.stdout)
+    reached = int(times[-1]) / 1e6 if times else 0.0
+    return reached >= 0.97 * duration if duration else reached > 0
+
+
 def _verify_file(path: str | None, duration: float | None) -> str | None:
     """Check the finished file is really there and complete. Returns a problem, or None."""
     if not path or not os.path.isfile(path):
@@ -240,7 +278,7 @@ def _verify_file(path: str | None, duration: float | None) -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if res.returncode != 0:
-        return "The downloaded file is damaged"
+        return DAMAGED
     try:
         real = float(res.stdout.split()[0])
     except (ValueError, IndexError):
@@ -314,12 +352,15 @@ class _FileLock:
         self.path, self.fd = path, None
 
     def acquire(self) -> bool:
-        if fcntl is None:
+        if fcntl is None and msvcrt is None:
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fcntl:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)      # locks the first byte (may lie past the end)
         except OSError:
             os.close(fd)
             return False
@@ -329,14 +370,27 @@ class _FileLock:
         return True
 
     def release(self):
-        if self.fd is not None:
+        if self.fd is None:
+            return
+        try:
+            self.path.unlink(missing_ok=True)       # POSIX: remove while still locked; Windows can't, see below
+        except OSError:
+            pass
+        if fcntl:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        else:
+            try:
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        os.close(self.fd)
+        self.fd = None
+        if not fcntl:
             try:
                 self.path.unlink(missing_ok=True)
             except OSError:
                 pass
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
-            self.fd = None
 
 
 class AlreadyRunning(RuntimeError):
@@ -780,6 +834,8 @@ class Manager:
         self._order: list | None = None                # _live in scheduler order (None: sort again)
         self.version = 0                               # bumped on every change; the live stream watches it
         self.speed_hist: deque = deque(maxlen=150)     # total speed every SPEED_SAMPLE seconds (5 minutes)
+        self.clock = time.time                         # for the download schedule (tests replace it)
+        self._ydls: set = set()                        # running YoutubeDL objects, for the total speed limit
         self.store = Store(DB_FILE, DB_BACKUP)
         self._load_state()
         self.last_event = self.store.last_event_id()
@@ -923,8 +979,26 @@ class Manager:
             _atomic_write(SETTINGS_FILE, json.dumps(self.settings, indent=2))
             self.version += 1
             self.cond.notify_all()
+            self._rebalance()
             log.info("Settings changed: %s", {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
             return dict(self.settings)
+
+    def _rate_for(self, running: int) -> float | None:
+        """Speed limit for each download (bytes/s): the per-download limit, or an equal share of the total."""
+        limits = []
+        if self.settings.get("rate_limit_mb"):
+            limits.append(float(self.settings["rate_limit_mb"]) * 1024 * 1024)
+        if self.settings.get("total_rate_mb"):
+            limits.append(float(self.settings["total_rate_mb"]) * 1024 * 1024 / max(1, running))
+        return min(limits) if limits else None
+
+    def _rebalance(self):
+        """Share the total speed limit between the downloads running now. yt-dlp reads params["ratelimit"]
+        on every chunk, so this applies to downloads already in progress."""
+        with self.cond:
+            rate = self._rate_for(len(self._ydls))
+            for ydl in self._ydls:
+                ydl.params["ratelimit"] = rate
 
     # ---- helpers
 
@@ -1018,14 +1092,15 @@ class Manager:
             f.flush()
             os.fsync(f.fileno())
 
-    def _archive_remove(self, outdir: str, key: str):
+    def _archive_remove(self, outdir: str, *keys: str):
         path = Path(outdir) / ARCHIVE_NAME
+        drop = set(keys)
         with self._archive_lock:
             try:
                 lines = path.read_text(errors="ignore").splitlines()
             except OSError:
                 return
-            keep = [line for line in lines if line.strip() != key]
+            keep = [line for line in lines if line.strip() not in drop]
             if len(keep) != len(lines):
                 _atomic_write(path, "".join(line + "\n" for line in keep))
 
@@ -1093,11 +1168,26 @@ class Manager:
         with self.cond:
             self.version += 1
 
+    def _in_schedule(self) -> bool:
+        """True when downloads may start now (always, unless a download schedule is set)."""
+        s = self.settings
+        if not s.get("schedule_on"):
+            return True
+        t = time.localtime(self.clock())
+        now, start, end = t.tm_hour * 60 + t.tm_min, _minutes(s["schedule_start"]), _minutes(s["schedule_end"])
+        if start == end:
+            return True
+        return start <= now < end if start < end else now >= start or now < end   # e.g. 23:00–06:00
+
     def waiting_reason(self) -> str | None:
         """Why queued videos aren't starting, if it's a queue-wide reason."""
         now = time.time()
         if self.hold and now < self.hold["until"]:
             return f"{self.hold['reason']} (trying again in {_fmt_secs(self.hold['until'] - now)})"
+        if not self._in_schedule():
+            s = self.settings
+            return (f"Outside the download schedule ({s['schedule_start']}–{s['schedule_end']}) — "
+                    f"downloads start at {s['schedule_start']}")
         if self._wait_for_network():
             level = self.net_level()
             if level == "offline":
@@ -1281,6 +1371,13 @@ class Manager:
                         [p for p in candidates(it) if p != known]
                 work.append((it, it["status"], paths))
 
+        def verify(path: str, duration: float | None) -> tuple[str | None, bool]:
+            """-> (problem, rescued). A file ffprobe can't open is only damaged if it also fails a full decode."""
+            problem = _verify_file(path, duration)
+            if problem == DAMAGED and _decodes_fully(path, duration):
+                return None, True
+            return problem, False
+
         def check_one(args):
             it, was, paths = args
             if job["check"]["stop"] or job["id"] not in self.jobs:
@@ -1288,16 +1385,16 @@ class Manager:
             try:
                 if was in ("done", "skipped"):
                     if not paths:
-                        outcome, path, problem = "missing", None, None
+                        outcome, path, problem, rescued = "missing", None, None, False
                     else:
-                        path, problem = paths[0], _verify_file(paths[0], it.get("duration"))
+                        path, (problem, rescued) = paths[0], verify(paths[0], it.get("duration"))
                         outcome = "damaged" if problem else "ok"
                 elif paths:                                   # not marked downloaded, but a file is there
-                    path, problem = paths[0], _verify_file(paths[0], it.get("duration"))
+                    path, (problem, rescued) = paths[0], verify(paths[0], it.get("duration"))
                     outcome = "damaged-copy" if problem else "found"
                 else:
-                    outcome, path, problem = "nothing", None, None
-                self._apply_check(job, it, was, outcome, path, problem)
+                    outcome, path, problem, rescued = "nothing", None, None, False
+                self._apply_check(job, it, was, outcome, path, problem, rescued)
             except Exception:
                 log.exception("File check failed for %s", it["id"])
 
@@ -1310,8 +1407,9 @@ class Manager:
         log.info("File check of %r: %s", job["title"],
                  {k: chk[k] for k in ("done", "ok", "damaged", "missing", "found")} | {"stopped": chk["stop"]})
 
-    def _apply_check(self, job: dict, it: dict, was: str, outcome: str, path: str | None, problem: str | None):
-        note = None
+    def _apply_check(self, job: dict, it: dict, was: str, outcome: str, path: str | None, problem: str | None,
+                     rescued: bool = False):
+        note = "File check: ffprobe couldn't read the file, but it plays to the end — kept" if rescued else None
         with self.cond:
             chk = job["check"]
             chk["done"] += 1
@@ -1349,7 +1447,7 @@ class Manager:
                 note = f"File check: damaged copy {problem} → renamed to {os.path.basename(aside)}"
             self._touch(job, it)
         if note:
-            self._item_log(job, it, "warning" if outcome != "found" else "info", note)
+            self._item_log(job, it, "info" if outcome in ("found", "ok") else "warning", note)
 
     def cleanup(self, job_id: str, dry_run: bool = True) -> dict:
         """Find (and delete) leftovers of this playlist: partial downloads, unmerged streams, stray
@@ -1439,9 +1537,8 @@ class Manager:
                     if it["status"] == "failed" or (it["status"] == "queued" and it["next_try"] > time.time()):
                         self._requeue(job, it, rev=job["rev"] + 1)
             elif action == "remove":
-                for it in job["items"]:
-                    it["cancel"] = True
-                del self.jobs[job_id]
+                self.remove(job_id)
+                return
             elif action == "open":
                 problem = _folder_problem(job["outdir"])
                 if problem:
@@ -1458,15 +1555,210 @@ class Manager:
         with self.cond:
             job = self.get(job_id)
             item = self._get_item(job, item_id)
+            st = item["status"]
             if action == "cancel":
-                if item["status"] == "queued":
-                    item.update(status="new", error=None)
-                elif item["status"] in ACTIVE:
+                if st == "queued":
+                    item.update(status="new", error=None, held=False)
+                elif st in ACTIVE:
                     item["cancel"] = True
-            elif action == "retry" and item["status"] in ("failed", "queued"):
+            elif action == "retry" and st in ("failed", "queued"):
                 self._requeue(job, item)
+            elif action == "hold":                      # pause this one video; a running one stops and keeps its .part
+                if st not in LIVE:
+                    raise ValueError("Only videos in the queue can be paused")
+                item["held"] = True
+            elif action == "unhold":
+                item["held"] = False
+            elif action == "now":                       # skip the wait before the next retry
+                if st == "queued":
+                    item.update(next_try=0, held=False)
+            elif action in ("reveal", "play"):
+                path = item.get("filepath")
+                if not path or not os.path.isfile(path):
+                    raise ValueError("The file isn't in the folder any more")
+                _open_path(path, reveal=action == "reveal")
+                return
+            elif action == "delete-file":
+                self._delete_files(job, item)
+            elif action == "mark-done":
+                if st not in ("new", "failed"):
+                    raise ValueError("Only videos that aren't downloaded can be marked as downloaded")
+                outdir = item.get("outdir") or job["outdir"]
+                problem = _folder_problem(outdir)
+                if problem:
+                    raise ValueError(problem)
+                if self._archive_key(item) not in self._archive_ids(outdir):
+                    self._archive_add(outdir, self._archive_key(item))
+                item.update(status="skipped", progress=100.0, error=None, file_problem=None, outdir=outdir)
+                log.info("Marked %s as downloaded", item["id"])
+            else:
+                raise ValueError(f"Unknown action {action}")
             self._touch(job, item)
             self.cond.notify_all()
+
+    def _video_files(self, outdir: str, vid: str) -> list[Path]:
+        """Every file in outdir whose last "[...]" tag is this video id (final file, parts, sidecars)."""
+        try:
+            entries = list(Path(outdir).iterdir())
+        except OSError:
+            return []
+        return [p for p in entries if (ID_TAG.findall(p.name) or [None])[-1] == vid and p.is_file()]
+
+    def _delete_files(self, job: dict, item: dict):
+        """Delete a downloaded video's files (on the user's request) and mark it not downloaded."""
+        if item["status"] in LIVE or self._flight_key(job, item) in self.inflight:
+            raise ValueError("Stop the download first")
+        outdir = item.get("outdir") or job["outdir"]
+        files = self._video_files(outdir, item["id"])
+        size = sum(p.stat().st_size for p in files)
+        _remove(files)
+        self._archive_remove(outdir, self._archive_key(item))
+        item.update(status="new", filepath=None, health=None, file_problem=None, progress=0.0, error=None)
+        log.info("Deleted %d files (%d bytes) of %s", len(files), size, item["id"])
+
+    # ---- queue-wide controls
+
+    def move(self, job_id: str, item_id: str, to: str | None = None, before: tuple[str, str] | None = None):
+        """Reorder the queue: to="top"/"bottom", or drop the video just before another one (before=(job, id),
+        None = at the end)."""
+        with self.cond:
+            job = self.get(job_id)
+            item = self._get_item(job, item_id)
+            if item["status"] != "queued":
+                raise ValueError("Only videos waiting in the queue can be moved")
+            queued = [(j, it) for j, it in self._queue_order() if it["status"] == "queued"]
+            prios = [it.get("priority") or 0 for j, it in queued if it is not item]
+            if to == "top":
+                item["priority"] = max(prios, default=0) + 1
+            elif to == "bottom":
+                item["priority"] = min(prios, default=0) - 1
+            else:
+                order = [(j, it) for j, it in queued if it is not item]
+                pos = next((i for i, (j, it) in enumerate(order) if before and (j["id"], it["id"]) == tuple(before)),
+                           len(order))
+                order.insert(pos, (job, item))
+                for i, (j, it) in enumerate(order):     # number the whole queue in its new order
+                    if it.get("priority") != len(order) - i:
+                        it["priority"] = len(order) - i
+                        if it is not item:
+                            self._touch(j, it)
+            self._order = None
+            self._touch(job, item)
+            self.cond.notify_all()
+
+    def clear_hold(self):
+        """The "Try now" on a queue-wide pause (rate limit, disk full) once the user has fixed the cause."""
+        with self.cond:
+            self.hold = None
+            self.next_start = 0.0
+            self.version += 1
+            self.cond.notify_all()
+        log.info("Queue-wide pause cleared by the user")
+
+    def retry_failed(self) -> int:
+        """Retry every failed video (that can still be downloaded) in every playlist."""
+        count = 0
+        with self.cond:
+            for job in self.jobs.values():
+                n = 0
+                for it in job["items"]:
+                    if it["status"] == "failed" and not it.get("removed"):
+                        self._requeue(job, it, rev=job["rev"] + 1)
+                        n += 1
+                if n:
+                    self._touch(job)
+                    count += n
+            self.cond.notify_all()
+        log.info("Retry all failed: %d videos", count)
+        return count
+
+    def pause_all(self, paused: bool):
+        with self.cond:
+            for job in self.jobs.values():
+                if job["paused"] != paused:
+                    job["paused"] = paused
+                    self._touch(job)
+            self.cond.notify_all()
+        log.info("%s all playlists", "Paused" if paused else "Resumed")
+
+    def remove(self, job_id: str, delete_files: bool = False):
+        """Remove a playlist from the library; with delete_files, also delete the files it downloaded."""
+        with self.cond:
+            job = self.get(job_id)
+            for it in job["items"]:
+                it["cancel"] = True
+            del self.jobs[job_id]
+            self._touch(job)
+            self.cond.notify_all()
+            keys = {self._flight_key(job, it) for it in job["items"]}
+        log.info("Removed %r%s", job["title"], " and its files" if delete_files else "")
+        if delete_files:
+            threading.Thread(target=self._delete_job_files, args=(job, keys), name="remove-files", daemon=True).start()
+
+    def _delete_job_files(self, job: dict, keys: set):
+        end = time.time() + 60
+        while True:                                     # let cancelled downloads let go of their files first
+            with self.cond:
+                busy = keys & self.inflight
+            if not busy:
+                break
+            if time.time() > end:
+                log.warning("Not deleting the files of %r: downloads didn't stop", job["title"])
+                return
+            time.sleep(0.5)
+        folders: dict[str, list[dict]] = {}
+        for it in job["items"]:
+            folders.setdefault(it.get("outdir") or job["outdir"], []).append(it)
+        removed, size = 0, 0
+        for outdir, items in folders.items():
+            with self.cond:                             # never delete a video another playlist here still has
+                shared = {it["id"] for j in self.jobs.values() for it in j["items"]
+                          if os.path.normpath(it.get("outdir") or j["outdir"]) == os.path.normpath(outdir)}
+            mine = [it for it in items if it["id"] not in shared]
+            for it in mine:
+                files = self._video_files(outdir, it["id"])
+                size += sum(p.stat().st_size for p in files if p.exists())
+                _remove(files)
+                removed += len(files)
+            self._archive_remove(outdir, *(self._archive_key(it) for it in mine))
+            for leftover in (Path(outdir) / ARCHIVE_NAME, Path(outdir) / LOCK_DIR_NAME, Path(outdir)):
+                try:
+                    if leftover.is_dir():
+                        is_root = os.path.normpath(leftover) == os.path.normpath(
+                            os.path.expanduser(self.settings["output_dir"]))
+                        if not is_root:
+                            leftover.rmdir()            # only when empty
+                    elif leftover.exists() and leftover.stat().st_size == 0:
+                        leftover.unlink()
+                except OSError:
+                    pass
+        log.info("Deleted %d files (%d bytes) of removed playlist %r", removed, size, job["title"])
+
+    def export_m3u(self, job_id: str) -> dict:
+        """Write "<playlist>.m3u8" into the playlist's folder, listing its downloaded videos in playlist order."""
+        with self.cond:
+            job = self.get(job_id)
+            outdir = job["outdir"]
+            entries = sorted((it["index"], it["title"], it.get("duration"), it["filepath"]) for it in job["items"]
+                             if it["status"] in ("done", "skipped") and it.get("filepath"))
+        lines = ["#EXTM3U", f"#PLAYLIST:{job['title']}"]
+        count = 0
+        for _, title, duration, path in entries:
+            if not os.path.isfile(path):
+                continue
+            try:
+                rel = os.path.relpath(path, outdir)
+            except ValueError:                          # another drive (Windows)
+                rel = path
+            title = " ".join(str(title).split())
+            lines += [f"#EXTINF:{int(duration) if duration else -1},{title}", rel.replace(os.sep, "/")]
+            count += 1
+        if not count:
+            raise ValueError("No downloaded videos in this playlist yet")
+        path = Path(outdir) / (_safe_name(job["title"]) + ".m3u8")
+        _atomic_write(path, "\n".join(lines) + "\n")
+        log.info("Exported %d videos of %r to %s", count, job["title"], path)
+        return {"path": str(path), "name": path.name, "count": count}
 
     def item_log(self, job_id: str, item_id: str) -> dict:
         """Everything the detail views show about one video."""
@@ -1632,7 +1924,7 @@ class Manager:
 
     def _next_item(self):
         now = time.time()
-        if (self.hold and now < self.hold["until"]) or now < self.next_start:
+        if (self.hold and now < self.hold["until"]) or now < self.next_start or not self._in_schedule():
             return None
         level = self.net_level() if self._wait_for_network() else "unknown"
         if level == "offline":
@@ -1766,8 +2058,9 @@ class Manager:
             "windowsfilenames": True,
             "overwrites": False,
         }
-        if self.settings.get("rate_limit_mb"):
-            opts["ratelimit"] = float(self.settings["rate_limit_mb"]) * 1024 * 1024
+        rate = self._rate_for(len(self._ydls) + 1)
+        if rate:
+            opts["ratelimit"] = rate
         if str(options.get("quality", "best")) not in AUDIO_FORMATS:
             # Keep the separate video/audio streams until the merged file is verified, so a bad merge can be
             # redone locally instead of downloading everything again. They are deleted below once it's good.
@@ -1780,7 +2073,15 @@ class Manager:
                         ydl.add_post_processor(_PlaylistTags({"album": job["title"], "track": item["number"].lstrip("0")}),
                                                when="pre_process")
                     ydl.add_post_processor(_FormatNote(lambda fmt: self._set(job, item, fmt=fmt)), when="before_dl")
-                    info = ydl.extract_info(item["url"], download=True) or {}
+                    with self.cond:
+                        self._ydls.add(ydl)
+                    self._rebalance()
+                    try:
+                        info = ydl.extract_info(item["url"], download=True) or {}
+                    finally:
+                        with self.cond:
+                            self._ydls.discard(ydl)
+                        self._rebalance()
                 filepath = ((info.get("requested_downloads") or [{}])[0].get("filepath")) or info.get("filepath")
                 parts = _part_files(outdir, item["id"])
                 self._set(job, item, status="processing", step="Checking stream sizes", speed=None, eta=None)
@@ -1879,10 +2180,18 @@ class Manager:
             self.on_network_error()
 
 
-def _open_folder(path: str):
+def _open_path(path: str, reveal: bool = False):
+    """Open a file or folder in its default app; reveal=True shows the file in Finder/Explorer instead."""
     if sys.platform == "darwin":
-        subprocess.Popen(["open", path])
+        subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
     elif sys.platform.startswith("win"):
-        os.startfile(path)  # type: ignore[attr-defined]
+        if reveal:
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        else:
+            os.startfile(path)  # type: ignore[attr-defined]
     else:
-        subprocess.Popen(["xdg-open", path])
+        subprocess.Popen(["xdg-open", os.path.dirname(path) if reveal else path])
+
+
+def _open_folder(path: str):
+    _open_path(path)

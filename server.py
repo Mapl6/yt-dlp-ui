@@ -67,6 +67,20 @@ class DownloadRequest(BaseModel):
     options: dict = {}
 
 
+class VideoRef(BaseModel):
+    job: str
+    id: str
+
+
+class MoveRequest(VideoRef):
+    to: str | None = None            # "top" | "bottom"; None = drop before `before` (or at the end)
+    before: VideoRef | None = None
+
+
+class RemoveRequest(BaseModel):
+    delete_files: bool = False
+
+
 @app.middleware("http")
 async def guard(request: Request, call_next):
     host = (request.headers.get("host") or "").lower()
@@ -92,8 +106,32 @@ def overview():
 
 
 @app.get("/api/activity")
-def activity():
-    return manager.activity()
+def activity(job: str | None = None, q: str | None = None):
+    return manager.activity(job, q)
+
+
+@app.post("/api/queue/move")
+def queue_move(req: MoveRequest):
+    try:
+        manager.move(req.job, req.id, req.to, (req.before.job, req.before.id) if req.before else None)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'\""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/queue/{action}")
+def queue_action(action: str):
+    if action == "clear-hold":
+        manager.clear_hold()
+    elif action == "retry-failed":
+        return {"queued": manager.retry_failed()}
+    elif action in ("pause-all", "resume-all"):
+        manager.pause_all(action == "pause-all")
+    else:
+        raise HTTPException(404, "Unknown action")
+    return {"ok": True}
 
 
 @app.post("/api/net/check")
@@ -163,6 +201,8 @@ def item_action(job_id: str, item_id: str, action: str):
         manager.item_action(job_id, item_id, action)
     except KeyError as exc:
         raise HTTPException(404, str(exc).strip("'\""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"ok": True}
 
 
@@ -197,6 +237,25 @@ def cleanup(job_id: str):
         return manager.cleanup(job_id, dry_run=False)
     except KeyError:
         raise HTTPException(404, "Playlist not found")
+
+
+@app.post("/api/jobs/{job_id}/remove")
+def remove_job(job_id: str, req: RemoveRequest | None = None):
+    try:
+        manager.remove(job_id, bool(req and req.delete_files))
+    except KeyError:
+        raise HTTPException(404, "Playlist not found")
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/m3u")
+def export_m3u(job_id: str):
+    try:
+        return manager.export_m3u(job_id)
+    except KeyError:
+        raise HTTPException(404, "Playlist not found")
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.post("/api/jobs/{job_id}/{action}")
