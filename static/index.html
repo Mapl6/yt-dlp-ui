@@ -156,6 +156,10 @@
         <label data-video-only><input type="checkbox" data-opt="subtitles"> Embed subtitles</label>
         <label data-subs-only><input type="checkbox" data-opt="auto_subs"> Include auto-generated subtitles</label>
       </div>
+      <div class="opts-save">
+        <span class="muted" data-role="opts-state" aria-live="polite"></span>
+        <button class="small" type="button" data-role="save-opts" disabled title="Keep these options for this playlist without downloading anything">Save options</button>
+      </div>
       <div class="sync-row" data-playlist-only>
         <label>Check for new videos
           <select data-role="sync-every">
@@ -216,15 +220,38 @@
     </label>
     <div class="field-row">
       <label>Parallel downloads <input id="set-concurrency" type="number" min="1" max="8"></label>
-      <label>Use cookies from browser
-        <select id="set-cookies">
-          <option value="">None</option>
-          <option>chrome</option><option>safari</option><option>firefox</option>
-          <option>brave</option><option>edge</option><option>chromium</option><option>opera</option><option>vivaldi</option>
-        </select>
+      <label>Subtitle languages <input id="set-sublangs" type="text" placeholder="en, fa">
+        <small>Default for new downloads, e.g. “en, fa”.</small>
       </label>
     </div>
-    <small class="field-note">Cookies are needed for age-restricted or members-only videos, or if YouTube asks you to confirm you’re not a bot.</small>
+    <div class="cookies" id="cookies-section">
+      <div class="cookies-head">Cookies
+        <small>Needed for age-restricted or members-only videos, and when YouTube asks you to confirm you’re not a bot. Use the browser you’re signed in to YouTube with.</small>
+      </div>
+      <div class="field-row">
+        <label>Use cookies from browser
+          <select id="set-cookies"><option value="">None</option></select>
+        </label>
+        <label>Profile
+          <select id="set-cookies-profile"><option value="">Most recently used</option></select>
+        </label>
+      </div>
+      <p class="cookie-note" id="cookies-note" hidden></p>
+      <div class="cookie-test">
+        <button type="button" class="small" id="btn-cookies-test">Test cookies</button>
+        <span class="cookie-status" id="cookies-test-status" role="status"></span>
+      </div>
+      <div class="cookie-file">
+        <div>Cookies file (cookies.txt)
+          <small id="cookie-file-state">None imported. Export cookies.txt from a signed-in YouTube tab with a browser extension (e.g. “Get cookies.txt LOCALLY”) and import it here. While a file is imported, it is used instead of the browser.</small>
+        </div>
+        <div class="backup-btns">
+          <button type="button" class="small" id="btn-cookie-import">Import cookies…</button>
+          <button type="button" class="small ghost hidden" id="btn-cookie-remove">Remove</button>
+        </div>
+        <input type="file" id="cookie-file" accept=".txt,text/plain" hidden>
+      </div>
+    </div>
     <label>Proxy (optional) <input id="set-proxy" type="text" placeholder="socks5://127.0.0.1:1080">
       <small>Use this if YouTube is blocked on your network (VPN / proxy client address).</small>
     </label>
@@ -239,21 +266,16 @@
         <small>Shared by all downloads. 0 = unlimited</small>
       </label>
     </div>
-    <div class="field-row">
-      <label>Pause between videos (s) <input id="set-sleep" type="number" min="0" step="1">
-        <small>Helps avoid rate limiting.</small>
-      </label>
-      <label>Subtitle languages <input id="set-sublangs" type="text" placeholder="en, fa">
-        <small>Default for new downloads, e.g. “en, fa”.</small>
-      </label>
-    </div>
+    <label>Pause between videos (s) <input id="set-sleep" type="number" min="0" step="1">
+      <small>Helps avoid rate limiting.</small>
+    </label>
     <div class="inline sched">
       <label class="inline-check"><input id="set-sched-on" type="checkbox"> Only start downloads between</label>
       <span class="sched-times"><input id="set-sched-start" type="time" aria-label="From"> and <input id="set-sched-end" type="time" aria-label="Until"></span>
       <small>Outside these hours videos wait in the queue. A video already downloading finishes.</small>
     </div>
     <label class="inline"><input id="set-notify" type="checkbox"> <span>Desktop notifications
-      <small>When a playlist finishes downloading or a video fails.</small></span>
+      <small id="notify-note">When a playlist finishes downloading or a video fails.</small></span>
     </label>
     <div class="ytdlp">
       <div><b id="ytdlp-version">yt-dlp</b> <span class="ytdlp-state" id="ytdlp-latest"></span></div>

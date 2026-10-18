@@ -385,6 +385,17 @@ dialog h3 { font-size: 18px; font-weight: 650; }
 .backup-btns { display: flex; gap: 8px; }
 .backup-status { flex-basis: 100%; margin: 0; font-size: 12.5px; font-weight: 400; color: var(--text); }
 .backup-status.err { color: var(--err); }
+.cookies { display: grid; gap: 12px; padding: 12px; border-radius: 10px; background: var(--surface-2); }
+.cookies-head { display: grid; gap: 3px; font-size: 13px; font-weight: 500; }
+.cookie-note { margin: -4px 0 0; font-size: 12px; color: var(--warn); }
+.cookie-test { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.cookie-status { font-size: 12.5px; }
+.cookie-status.ok { color: var(--ok); }
+.cookie-status.warn { color: var(--warn); }
+.cookie-status.err { color: var(--err); }
+.cookie-file { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; font-weight: 500; }
+.cookie-file > div:first-child { flex: 1 1 240px; display: grid; gap: 3px; }
 #settings-dialog { max-height: calc(100dvh - 32px); overflow-y: auto; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
@@ -542,6 +553,7 @@ table.data th { color: var(--muted); font-weight: 600; }
 
 /* ---------- playlist card additions */
 .opts-panel .options + .options { margin-top: 12px; }
+.opts-save { display: flex; gap: 12px; align-items: center; justify-content: flex-end; margin-top: 12px; font-size: 12.5px; }
 .part-row { display: flex; gap: 6px; align-items: center; color: var(--muted); }
 .part-row input { width: 92px; }
 .sync-row { display: flex; gap: 10px 20px; align-items: flex-end; flex-wrap: wrap; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
@@ -581,6 +593,7 @@ button.icon svg circle { fill: currentColor; stroke: none; }
 .url-row button.ghost { padding: 0 12px; color: var(--muted); font-weight: 500; }
 .wait-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .wait-banner button { height: 28px; }
+.wait-btns { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* ---------- dialogs: settings additions, remove, shortcuts */
 #settings-form .sched, .ytdlp { display: grid; gap: 8px; padding: 12px; border-radius: 10px; background: var(--surface-2); font-size: 13px; }

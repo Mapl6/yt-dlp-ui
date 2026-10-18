@@ -136,8 +136,125 @@ check("net restored: backoff cleared", it["next_try"] == 0)
 it.update(status="downloading")
 mgr._handle_failure(mgr.jobs[job["id"]], it, Exception("HTTP Error 429: Too Many Requests"))
 check("rate limit: whole queue held", mgr.hold and mgr.hold["until"] > time.time(), mgr.waiting_reason())
-mgr.hold = None
+check("rate limit: doesn't use up the connection-problem allowance", it["net_attempts"] == 1 and it["rate_attempts"] == 1,
+      (it["net_attempts"], it["rate_attempts"]))
+mgr._clear_hold(probe=False)
 it.update(status="done")
+
+# ---------- rate limiting: waves, restarts, one video first, cookie and proxy changes (2026-10-17 incident)
+level["v"] = "offline"                               # keep the workers idle while failures are simulated
+BOT = Exception("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies")
+fj = {"id": "fake-job", "title": "Fake", "rev": 0, "items": []}   # not in the library: never scheduled
+
+def fake_item(name, started):
+    return {"id": name, "title": name, "status": "downloading", "started": started, "attempts": 0, "net_attempts": 0,
+            "rate_attempts": 0, "history": [], "log": [], "rev": 0, "next_try": 0}
+
+t0 = time.time()
+wave = [fake_item(f"w{i}", t0) for i in range(3)]
+for x in wave:
+    mgr._handle_failure(fj, x, BOT)
+left = mgr.hold["until"] - time.time() if mgr.hold else 0
+check("rate wave: three downloads blocked together count as one strike", mgr.rate_strikes == 1 and 50 < left <= 60,
+      (mgr.rate_strikes, round(left)))
+check("rate wave: the blocked videos wait in the queue", all(x["status"] == "queued" for x in wave), [x["status"] for x in wave])
+check("rate wave: the pause says it's rate limiting", mgr.hold.get("kind") == "ratelimit", mgr.hold)
+check("rate probe: afterwards one download at a time", mgr._limit() == 1, mgr._limit())
+time.sleep(0.02)
+mgr._handle_failure(fj, fake_item("probe", time.time()), BOT)   # started after the last strike: a new wave
+check("rate wave: a download started later is a new wave (pause doubles)",
+      mgr.rate_strikes == 2 and mgr.hold["until"] - time.time() > 100, (mgr.rate_strikes, mgr.hold))
+
+saved = object.__new__(M.Manager)                    # what a restarted app reads back
+saved.hold = None
+M.Manager._load_queue_state(saved)
+check("restart: the pause and 'one video first' are restored",
+      saved.hold and saved.hold["kind"] == "ratelimit" and abs(saved.hold["until"] - mgr.hold["until"]) < 0.01
+      and saved.rate_probe and saved.rate_strikes == 2, (saved.hold, saved.rate_probe, saved.rate_strikes))
+
+# r0vBkQgd5h0 failed after 2 network errors and 6 bot checks: now neither counts against the other, and a block
+# that hits everything keeps the video queued.
+v = fake_item("r0vBkQgd5h0", t0)
+for _ in range(2):
+    v["status"] = "downloading"
+    mgr._handle_failure(fj, v, Exception("Unable to download video data: <urlopen error timed out>"))
+for _ in range(M.MAX_RATE_STRIKES + 2):
+    v["status"] = "downloading"
+    mgr._handle_failure(fj, v, BOT)
+check("rate limit: network and rate-limit errors are counted apart",
+      v["net_attempts"] == 2 and v["rate_attempts"] == M.MAX_RATE_STRIKES + 2, (v["net_attempts"], v["rate_attempts"]))
+check("rate limit: a block on every video never fails the video", v["status"] == "queued", (v["status"], v["error"]))
+for _ in range(M.RATE_BLOCK_STRIKES):
+    time.sleep(0.01)
+    mgr._handle_failure(fj, fake_item("again", time.time()), BOT)
+check("rate limit: repeated waves ask for cookies or a VPN", "cookies" in mgr.hold["reason"] and "VPN" in mgr.hold["reason"],
+      mgr.hold["reason"])
+mgr.last_success = time.time()                       # other videos download fine now; only this one is blocked
+v["status"] = "downloading"
+mgr._handle_failure(fj, v, BOT)
+check("rate limit: fails a video only when others download meanwhile", v["status"] == "failed", (v["status"], v["error"]))
+
+mgr.update_settings({"proxy": "http://127.0.0.1:9"})
+check("identity change: a new proxy clears the rate-limit pause and 'one video first'",
+      mgr.hold is None and not mgr.rate_probe and mgr.rate_strikes == 0, (mgr.hold, mgr.rate_probe, mgr.rate_strikes))
+mgr._hold_queue("Disk is full", 60, "disk")
+mgr.update_settings({"proxy": ""})
+check("identity change: a disk-full pause stays", (mgr.hold or {}).get("kind") == "disk", mgr.hold)
+mgr._clear_hold(probe=False)
+
+# cookie errors: one pause with an explanation, no attempts used, cleared by changing the cookie settings
+CHROME = 'ERROR: could not find chrome cookies database in "/Users/x/Library/Application Support/Google/Chrome"'
+check("classify cookies  <- could not find chrome cookies database", M._error_kind(CHROME) == "cookies", M._error_kind(CHROME))
+check("classify cookies  <- CookieLoadError", M._error_kind(M.CookieLoadError("failed to load cookies")) == "cookies")
+check("classify ratelimit <- bot check that mentions --cookies", M._error_kind(BOT) == "ratelimit", M._error_kind(BOT))
+mgr.update_settings({"cookies_browser": "chrome"})
+c = fake_item("c1", time.time())
+mgr._handle_failure(fj, c, Exception(CHROME))
+check("cookie error: whole queue paused with an explanation",
+      (mgr.hold or {}).get("kind") == "cookies" and "chrome" in mgr.hold["reason"].lower(), mgr.hold)
+check("cookie error: the video waits, no attempt used",
+      c["status"] == "queued" and c["attempts"] == 0 and c["net_attempts"] == 0, (c["status"], c["attempts"]))
+mgr.update_settings({"cookies_browser": "", "cookies_profile": ""})
+check("cookie error: changing the browser clears the pause", mgr.hold is None, mgr.hold)
+
+# yt-dlp's messages start with ERROR:/WARNING: and the item log adds its own level
+got = []
+lg = M._ItemLogger(lambda level, msg: got.append(msg))
+lg.error("ERROR: [youtube] abc: boom")
+lg.warning("\x1b[0;33mWARNING:\x1b[0m slow")
+check("item log: no doubled ERROR: prefix", got == ["[youtube] abc: boom", "slow"], got)
+
+# browsers and profiles found on this computer (a fake home folder)
+if sys.platform == "darwin":
+    real_home = os.environ["HOME"]
+    home = TMP / "home"
+    sup = home / "Library" / "Application Support"
+    (sup / "Arc" / "User Data" / "Profile 1" / "Network").mkdir(parents=True)
+    (sup / "Arc" / "User Data" / "Profile 1" / "Network" / "Cookies").write_bytes(b"")
+    (sup / "Arc" / "User Data" / "Local State").write_text(json.dumps({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}}))
+    (sup / "Google" / "Chrome" / "Crashpad").mkdir(parents=True)          # installed, but no profile with cookies
+    os.environ["HOME"] = str(home)
+    try:
+        found = {b["browser"]: b for b in M.cookie_sources()}
+    finally:
+        os.environ["HOME"] = real_home
+    check("cookie sources: Arc profile found with its name",
+          found.get("arc", {}).get("profiles") == [{"id": "Profile 1", "name": "Work"}], found.get("arc"))
+    check("cookie sources: Chrome without profiles is reported, not offered as working",
+          found.get("chrome", {}).get("status") == "no-profiles", found.get("chrome"))
+    check("cookie sources: browsers that aren't installed are left out", "brave" not in found, list(found))
+
+# the probe: after the pause, one download runs; when it works, the queue is back to normal
+mgr.update_settings({"cookies_browser": ""})
+mgr.rate_probe, mgr.rate_strikes = True, 2
+for f in (p for p in out.iterdir() if p.is_file()):
+    f.unlink()
+it["status"] = "new"
+level["v"] = "good"
+mgr.queue(job["id"], None, dict(OPTS))
+check("rate probe: the probe download finishes", wait_status(job, {"done"}) == ["done"])
+check("rate probe: a working download ends 'one video first'", not mgr.rate_probe and mgr.rate_strikes == 0,
+      (mgr.rate_probe, mgr.rate_strikes))
 
 # ---------- e2e 4: same video in two jobs/same folder is never downloaded twice at once
 k = mgr._flight_key(mgr.jobs[job["id"]], it)

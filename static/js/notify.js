@@ -1,22 +1,40 @@
 // Desktop notifications (opt-in): a playlist finished downloading, or a video failed.
 // In the Mac app the native bridge is used; in a browser, the Notification API.
+// The choice is a setting on the server (settings.notify), so it survives the Mac app's private browser
+// storage and is the same in every browser; the browser's own permission is asked for when the box is ticked.
 
 import { api } from "./api.js";
 import { store } from "./util.js";
 
 let lastEvent = null;              // newest event id already seen
 const jobStatus = new Map();       // playlist id -> status at the previous update
+let enabled = false;
 
-export const notifyEnabled = () => store.get("notify", false) === true;
+export const notifyEnabled = () => enabled;
 
-export async function setNotify(on) {
-  if (on && !window.pywebview?.api?.notify && "Notification" in window && Notification.permission !== "granted") {
-    const answer = await Notification.requestPermission();
-    if (answer !== "granted") { store.set("notify", false); return false; }
-  }
-  store.set("notify", !!on);
-  return !!on;
+/** Called with every settings update from the server. */
+export function setNotifyEnabled(on) {
+  enabled = !!on;
 }
+
+/** Earlier versions kept the choice in this browser only: returns true once if it should move to the server. */
+export function takeLegacyNotify() {
+  const old = store.get("notify", null);
+  if (old === null) return false;
+  try { localStorage.removeItem("notify"); } catch {}
+  return old === true;
+}
+
+/** Ask the browser for permission. Must run from a click: Safari refuses the request otherwise. */
+export async function askPermission() {
+  if (window.pywebview?.api?.notify || !("Notification" in window)) return true;
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") return false;
+  return (await Notification.requestPermission()) === "granted";
+}
+
+export const permissionDenied = () =>
+  !window.pywebview?.api?.notify && "Notification" in window && Notification.permission === "denied";
 
 export function notifySupported() {
   return !!window.pywebview?.api?.notify || "Notification" in window;

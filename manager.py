@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import errno
 import json
@@ -31,6 +32,8 @@ except ImportError:
     msvcrt = None
 
 import yt_dlp
+from yt_dlp import cookies as ytdlp_cookies
+from yt_dlp.cookies import CookieLoadError
 from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
@@ -49,7 +52,9 @@ LOCK_DIR_NAME = ".ytdl-locks"                     # per-video locks inside the d
 MAX_WORKERS = 8          # hard upper bound for parallel downloads
 MAX_ATTEMPTS = 4         # per item, for unexpected errors
 MAX_NET_ATTEMPTS = 40    # per item, for connection problems (weak internet must never lose a video)
-MAX_RATE_STRIKES = 8     # per item, for YouTube rate limiting
+MAX_RATE_STRIKES = 8     # per item: a video fails only if other downloads work while it alone is blocked
+RATE_BLOCK_STRIKES = 3   # waves of rate limiting before the banner says to change cookies or VPN
+COOKIE_HOLD = 3600       # a cookie error pauses the queue until the settings change (or this runs out)
 MIN_FREE_BYTES = 1 << 30 # pause everything below 1 GB free
 BACKUP_EVERY = 600       # seconds between copies of the library to library.backup.db
 ITEM_LOG_LINES = 40      # warnings/errors kept per video for the "Details" view
@@ -58,7 +63,8 @@ ACTIVE = {"downloading", "processing"}
 DEFAULT_SETTINGS = {
     "output_dir": str(Path.home() / "Downloads" / "YT Downloader"),
     "concurrency": 3,
-    "cookies_browser": "",       # "", chrome, safari, firefox, brave, edge, ...
+    "cookies_browser": "",       # "", chrome, safari, firefox, brave, edge, arc, chrome-canary ...
+    "cookies_profile": "",       # browser profile folder ("Default", "Profile 1", a Firefox profile path); "" = newest
     "rate_limit_mb": 0.0,        # per download, 0 = unlimited
     "sleep_between": 0.0,        # seconds between starting downloads (helps avoid 429s)
     "proxy": "",                 # e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080
@@ -68,6 +74,7 @@ DEFAULT_SETTINGS = {
     "schedule_start": "01:00",
     "schedule_end": "07:00",
     "sub_langs": "en",           # default subtitle languages, e.g. "en, fa"
+    "notify": False,             # desktop notifications (finished playlist, failed video)
 }
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -91,6 +98,11 @@ PERMANENT_ERRORS = re.compile(
     re.I,
 )
 RATE_LIMIT_ERRORS = re.compile(r"http error 429|too many requests|confirm you.?re not a bot|rate.?limit", re.I)
+COOKIE_ERRORS = re.compile(
+    r"could not find [\w -]+ cookies database|cookies database not found|failed to (?:load|decrypt) cookies|"
+    r"unsupported browser(?: specified for cookies)?:|cookies?\b.*operation not permitted",
+    re.I,
+)
 NETWORK_ERRORS = re.compile(
     r"timed? ?out|connection (?:reset|refused|aborted|error|broken)|remote end closed|broken pipe|"
     r"network is unreachable|no route to host|temporary failure in name resolution|name or service not known|"
@@ -150,8 +162,10 @@ def _exc_chain(exc: BaseException) -> list[BaseException]:
 
 
 def _error_kind(exc: BaseException | str) -> str:
-    """disk | permanent | ratelimit | network | other"""
+    """disk | cookies | permanent | ratelimit | network | other"""
     chain = [] if isinstance(exc, str) else _exc_chain(exc)
+    if any(isinstance(e, CookieLoadError) for e in chain):
+        return "cookies"                             # the browser's cookies couldn't be read: no retry fixes it
     for e in chain:
         if isinstance(e, OSError) and e.errno == errno.ENOSPC:
             return "disk"
@@ -165,7 +179,8 @@ def _error_kind(exc: BaseException | str) -> str:
         if isinstance(e, GeoRestrictedError):
             return "permanent"
     msg = exc if isinstance(exc, str) else " | ".join(_clean_error(e) for e in chain)
-    for kind, rx in (("disk", DISK_ERRORS), ("ratelimit", RATE_LIMIT_ERRORS), ("permanent", PERMANENT_ERRORS)):
+    for kind, rx in (("disk", DISK_ERRORS), ("cookies", COOKIE_ERRORS), ("ratelimit", RATE_LIMIT_ERRORS),
+                     ("permanent", PERMANENT_ERRORS)):
         if rx.search(msg):
             return kind
     if any(isinstance(e, (TransportError, ContentTooShortError, socket.timeout, TimeoutError, ConnectionError))
@@ -188,6 +203,10 @@ def _escape_tmpl(text: str) -> str:
 def _safe_name(text: str) -> str:
     text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text).strip(" .")
     return text[:120] or "Untitled"
+
+
+def _queue_state_file() -> Path:
+    return DATA_DIR / "queue_state.json"          # the queue-wide pause, kept across restarts
 
 
 def _fmt_secs(s: float) -> str:
@@ -568,14 +587,16 @@ class _QuietLogger:
 class _ItemLogger(_QuietLogger):
     """Keeps yt-dlp's warnings and errors for one video (shown under "Details") and writes them to app.log."""
 
+    LEVEL = re.compile(r"^(?:\x1b\[[0-9;]*m)*(?:ERROR|WARNING):(?:\x1b\[[0-9;]*m)*\s*")
+
     def __init__(self, add):
         self._add = add
 
     def warning(self, msg):
-        self._add("warning", msg)
+        self._add("warning", self.LEVEL.sub("", str(msg)))   # the log line has its own level: no "ERROR: ERROR:"
 
     def error(self, msg):
-        self._add("error", msg)
+        self._add("error", self.LEVEL.sub("", str(msg)))
 
 
 def _base_opts(settings: dict, logger=None) -> dict:
@@ -594,8 +615,257 @@ def _base_opts(settings: dict, logger=None) -> dict:
     if settings.get("proxy"):
         opts["proxy"] = settings["proxy"].strip()
     if settings.get("cookies_browser"):
-        opts["cookiesfrombrowser"] = (settings["cookies_browser"],)
+        opts["cookiesfrombrowser"] = (settings["cookies_browser"], settings.get("cookies_profile") or None)
     return opts
+
+
+# ---------------------------------------------------------------- browser cookies
+
+# Chromium browsers yt-dlp doesn't know by name: (folder under Application Support, keychain name).
+EXTRA_BROWSERS = {"arc": ("Arc/User Data", "Arc"), "chrome-canary": ("Google/Chrome Canary", "Chrome")} \
+    if sys.platform == "darwin" else {}
+BROWSER_NAMES = {"chrome": "Google Chrome", "chrome-canary": "Chrome Canary", "arc": "Arc", "brave": "Brave",
+                 "edge": "Microsoft Edge", "chromium": "Chromium", "opera": "Opera", "vivaldi": "Vivaldi",
+                 "whale": "Naver Whale", "firefox": "Firefox", "safari": "Safari"}
+LOGIN_COOKIES = {"SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "LOGIN_INFO"}
+FULL_DISK_HINT = ("macOS blocks access to it: open System Settings → Privacy & Security → Full Disk Access and "
+                  "turn it on for the app that runs YT Downloader (Terminal, or YT Downloader), then try again")
+
+
+def _register_extra_browsers():
+    """Teach yt-dlp the Chromium browsers in EXTRA_BROWSERS (it reads cookies from them like from Chrome)."""
+    orig = getattr(ytdlp_cookies, "_get_chromium_based_browser_settings", None)
+    if not EXTRA_BROWSERS or orig is None or getattr(orig, "_extra", False):
+        return
+
+    def settings(name):
+        if name in EXTRA_BROWSERS:
+            folder, keyring = EXTRA_BROWSERS[name]
+            return {"browser_dir": os.path.expanduser(f"~/Library/Application Support/{folder}"),
+                    "keyring_name": keyring, "supports_profiles": True}
+        return orig(name)
+
+    settings._extra = True
+    ytdlp_cookies._get_chromium_based_browser_settings = settings
+    ytdlp_cookies.SUPPORTED_BROWSERS.update(EXTRA_BROWSERS)
+    ytdlp_cookies.CHROMIUM_BASED_BROWSERS.update(EXTRA_BROWSERS)
+
+
+_register_extra_browsers()
+
+
+def _browser_dir(browser: str) -> str | None:
+    try:
+        return ytdlp_cookies._get_chromium_based_browser_settings(browser)["browser_dir"]
+    except Exception:
+        return None
+
+
+def _listdir(path: str) -> list[str] | None:
+    """Folder entries; None when the folder is missing; raises PermissionError when macOS blocks it."""
+    try:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _chromium_profiles(root: str) -> list[dict]:
+    names = {}
+    try:                                           # the names people gave their profiles ("Work", "Mahdi")
+        cache = json.loads((Path(root) / "Local State").read_text(encoding="utf-8"))["profile"]["info_cache"]
+        names = {k: (v.get("name") or k) for k, v in cache.items()}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    out = []
+    for entry in _listdir(root) or []:
+        base = Path(root) / entry
+        if (base / "Cookies").is_file() or (base / "Network" / "Cookies").is_file():
+            out.append({"id": entry, "name": names.get(entry, entry)})
+    if not out and ((Path(root) / "Cookies").is_file() or (Path(root) / "Network" / "Cookies").is_file()):
+        out.append({"id": "", "name": "Default"})   # browsers without profiles (Opera)
+    return out
+
+
+def cookie_sources() -> list[dict]:
+    """Browsers found on this computer that cookies can be read from, with their profiles.
+    status: ok | no-profiles (installed, but no profile with cookies) | blocked (macOS needs Full Disk Access)."""
+    found = []
+
+    def add(browser, profiles=None, status="ok", note=""):
+        found.append({"browser": browser, "name": BROWSER_NAMES.get(browser, browser.title()),
+                      "profiles": profiles or [], "status": status, "note": note})
+
+    chromium = sorted(ytdlp_cookies.CHROMIUM_BASED_BROWSERS, key=lambda b: list(BROWSER_NAMES).index(b)
+                      if b in BROWSER_NAMES else 99)
+    for browser in chromium:
+        root = _browser_dir(browser)
+        if not root:
+            continue
+        try:
+            if _listdir(root) is None:
+                continue
+            profiles = _chromium_profiles(root)
+        except PermissionError:
+            add(browser, status="blocked", note=FULL_DISK_HINT)
+            continue
+        add(browser, profiles, "ok" if profiles else "no-profiles",
+            "" if profiles else f"No profile with cookies in “{root}” — sign in to YouTube in this browser first, "
+                                "or the browser keeps its data somewhere else")
+    try:
+        roots = list(ytdlp_cookies._firefox_browser_dirs())
+    except Exception:
+        roots = []
+    ff, ff_blocked = [], False
+    for root in roots:
+        try:
+            for entry in _listdir(root) or []:
+                if (Path(root) / entry / "cookies.sqlite").is_file():
+                    ff.append({"id": str(Path(root) / entry), "name": entry.split(".", 1)[-1]})
+        except PermissionError:
+            ff_blocked = True
+    if ff:
+        add("firefox", ff)
+    elif ff_blocked:
+        add("firefox", status="blocked", note=FULL_DISK_HINT)
+    if sys.platform == "darwin":
+        for path in ("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+                     "~/Library/Cookies/Cookies.binarycookies"):
+            path = os.path.expanduser(path)
+            try:
+                with open(path, "rb") as f:
+                    f.read(4)
+                add("safari")
+                break
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                add("safari", status="blocked", note=FULL_DISK_HINT)
+                break
+    return found
+
+
+class _CookieLog:
+    def __init__(self):
+        self.warnings: list[str] = []
+
+    def debug(self, msg): pass
+    def info(self, msg): pass
+
+    def warning(self, msg, only_once=False):
+        self.warnings.append(str(msg))
+
+    def error(self, msg):
+        self.warnings.append(str(msg))
+
+
+def _cookie_error_text(browser: str, exc: BaseException) -> str:
+    msg = ANSI.sub("", str(exc)).strip()
+    if isinstance(exc, PermissionError) or "not permitted" in msg.lower():
+        return f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {FULL_DISK_HINT}"
+    if "could not find" in msg.lower():
+        root = _browser_dir(browser)
+        if root:
+            try:
+                os.listdir(root)
+            except PermissionError:
+                return f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {FULL_DISK_HINT}"
+            except OSError:
+                pass
+        return (f"{BROWSER_NAMES.get(browser, browser)} has no cookies to read ({msg}). Choose the browser and "
+                "profile you're signed in to YouTube with, or import a cookies.txt file")
+    return (f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {msg} — choose another browser "
+            "or profile in Settings, or import a cookies.txt file")
+
+
+def check_cookies(browser: str, profile: str = "") -> dict:
+    """Read a browser's cookies the way a download would, and say whether YouTube will see a signed-in user."""
+    if browser not in ytdlp_cookies.SUPPORTED_BROWSERS:
+        return {"ok": False, "error": f"Unknown browser “{browser}”"}
+    logger = _CookieLog()
+    try:
+        jar = ytdlp_cookies.extract_cookies_from_browser(browser, profile or None, logger)
+    except Exception as exc:
+        return {"ok": False, "error": _cookie_error_text(browser, exc)}
+    yt = [c for c in jar if c.domain.lstrip(".").endswith(("youtube.com", "google.com"))]
+    signed_in = any(c.name in LOGIN_COOKIES for c in yt)
+    failed = [w for w in logger.warnings if "decrypt" in w.lower()]
+    out = {"ok": bool(yt), "total": len(jar), "youtube": len(yt), "signed_in": signed_in}
+    if not yt:
+        out["error"] = ("Couldn't decrypt the cookies — allow access when macOS asks for the keychain password"
+                        if failed else "No YouTube cookies in this profile — open YouTube in this browser and sign in")
+    elif not signed_in:
+        out["warning"] = "Found YouTube cookies but no signed-in account; signing in helps against the bot check"
+    return out
+
+
+# ---------------------------------------------------------------- imported cookies.txt
+
+MAX_COOKIE_FILE = 2 << 20
+
+
+def _cookie_file() -> Path:
+    return DATA_DIR / "cookies.txt"
+
+
+def _parse_cookie_text(text: str) -> list[tuple[str, str]]:
+    """(domain, name) of each cookie in a Netscape cookies.txt; ValueError if it isn't one."""
+    cookies = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif not line.strip() or line.startswith("#"):
+            continue
+        parts = line.rstrip("\r").split("\t")
+        if len(parts) != 7 or parts[1].upper() not in ("TRUE", "FALSE") or parts[3].upper() not in ("TRUE", "FALSE"):
+            raise ValueError(f"Line {n} isn't in the cookies.txt (Netscape) format. Export the cookies with a "
+                             "browser extension such as “Get cookies.txt LOCALLY”.")
+        cookies.append((parts[0].lstrip("."), parts[5]))
+    return cookies
+
+
+def _cookie_summary(cookies: list[tuple[str, str]]) -> dict:
+    yt = [(d, n) for d, n in cookies if d.endswith(("youtube.com", "google.com"))]
+    return {"count": len(cookies), "youtube": len(yt), "signed_in": any(n in LOGIN_COOKIES for _, n in yt)}
+
+
+_cookie_status_cache: dict = {}
+
+
+def cookie_file_status() -> dict | None:
+    """The imported cookies.txt: when, how many cookies, whether YouTube sees a signed-in user (cached by mtime)."""
+    path = _cookie_file()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if _cookie_status_cache.get("key") != (str(path), mtime):
+        try:
+            summary = _cookie_summary(_parse_cookie_text(path.read_text(encoding="utf-8", errors="replace")))
+        except (OSError, ValueError):
+            summary = {"count": 0, "youtube": 0, "signed_in": False}
+        _cookie_status_cache.update(key=(str(path), mtime), value=summary | {"imported": mtime})
+    return dict(_cookie_status_cache["value"])
+
+
+@contextlib.contextmanager
+def _ytdl(opts: dict):
+    """A YoutubeDL that uses the imported cookies.txt, if there is one, instead of the browser's cookies. Each one
+    gets its own copy of the file: yt-dlp writes the cookies back when it closes, and parallel downloads would
+    otherwise overwrite each other's copy."""
+    tmp = None
+    src = _cookie_file()
+    if src.is_file() and "cookiefile" not in opts:
+        tmp = DATA_DIR / ".cookies-tmp" / f"{uuid.uuid4().hex}.txt"
+        tmp.parent.mkdir(exist_ok=True)
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o600)
+        opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"} | {"cookiefile": str(tmp)}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            yield ydl
+    finally:
+        if tmp:
+            tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- inspection
@@ -603,7 +873,7 @@ def _base_opts(settings: dict, logger=None) -> dict:
 def inspect_url(url: str, settings: dict) -> dict:
     """Return metadata for a video or (flattened) playlist without downloading anything."""
     opts = _base_opts(settings) | {"skip_download": True, "extract_flat": "in_playlist"}
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with _ytdl(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         info = ydl.sanitize_info(info)
 
@@ -974,8 +1244,12 @@ class Manager:
             self.settings = _coerce_settings({})
         self.active = 0
         self.inflight: set[tuple[str, str]] = set()   # (folder, archive key) being downloaded right now
-        self.hold: dict | None = None                 # queue-wide pause: {"reason", "until"}
-        self.rate_strikes = 0
+        self.hold: dict | None = None                 # queue-wide pause: {"reason", "until", "kind", "since"}
+        self.rate_strikes = 0                         # waves of rate limiting in a row (each doubles the pause)
+        self.rate_wave = 0.0                          # when the last wave was counted
+        self.rate_probe = False                       # after rate limiting: one download at a time until one works
+        self.last_success = 0.0                       # when the last download finished and was verified
+        self._load_queue_state()
         self.next_start = 0.0                         # "pause between videos" spacing
         self.net_level = lambda: "checking"           # wired to NetMonitor by the server
         self.on_network_error = lambda: None
@@ -994,6 +1268,7 @@ class Manager:
         self._disk_cache: dict[str, tuple] = {}        # folder -> (time, _disk_free result)
         self.updating: dict | None = None              # progress of a yt-dlp update
         self._latest = {"version": None, "checked": 0, "checking": False}   # newest yt-dlp on PyPI
+        shutil.rmtree(DATA_DIR / ".cookies-tmp", ignore_errors=True)   # copies left by a crash
         self.store = Store(DB_FILE, DB_BACKUP)
         self._load_state()
         self.last_event = self.store.last_event_id()
@@ -1009,6 +1284,31 @@ class Manager:
         threading.Thread(target=self._syncer, name="auto-sync", daemon=True).start()
 
     # ---- persistence
+
+    def _load_queue_state(self):
+        """A rate-limit pause survives a restart: otherwise every queued video would hit YouTube again at once."""
+        try:
+            state = json.loads(_queue_state_file().read_text())
+        except (OSError, ValueError):
+            return
+        hold = state.get("hold")
+        if isinstance(hold, dict) and float(hold.get("until") or 0) > time.time():
+            self.hold = {"reason": str(hold.get("reason") or "Paused"), "until": float(hold["until"]),
+                         "kind": hold.get("kind") or "other", "since": float(hold.get("since") or time.time())}
+        self.rate_strikes = int(state.get("rate_strikes") or 0)
+        self.rate_wave = float(state.get("rate_wave") or 0)
+        self.rate_probe = bool(state.get("rate_probe"))
+        self.last_success = float(state.get("last_success") or 0)
+        if self.hold or self.rate_probe:
+            log.info("Restored queue pause: %s (one video first: %s)", self.hold, self.rate_probe)
+
+    def _save_queue_state(self):
+        state = {"hold": self.hold, "rate_strikes": self.rate_strikes, "rate_wave": self.rate_wave,
+                 "rate_probe": self.rate_probe, "last_success": self.last_success}
+        try:
+            _atomic_write(_queue_state_file(), json.dumps(state))
+        except OSError as exc:
+            log.error("Could not save the queue pause: %s", exc)
 
     def _load_state(self):
         jobs = self.store.load()
@@ -1052,6 +1352,7 @@ class Manager:
         it.setdefault("options", job.get("options", {}))
         it.setdefault("outdir", job["outdir"])
         it.setdefault("net_attempts", 0)
+        it.setdefault("rate_attempts", 0)
         it.setdefault("removed", False)
         it.setdefault("log", [])
         it.setdefault("priority", 0)
@@ -1144,13 +1445,52 @@ class Manager:
 
     def update_settings(self, patch: dict) -> dict:
         with self.cond:
+            old = self.settings
             self.settings = _coerce_settings(self.settings | {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
             _atomic_write(SETTINGS_FILE, json.dumps(self.settings, indent=2))
             self.version += 1
             self.cond.notify_all()
             self._rebalance()
             log.info("Settings changed: %s", {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
+            if any(old.get(k) != self.settings.get(k) for k in ("cookies_browser", "cookies_profile", "proxy")):
+                self._identity_changed("Cookie or proxy settings changed")
             return dict(self.settings)
+
+    def import_cookies(self, text: str) -> dict:
+        """Save a cookies.txt (Netscape format) for yt-dlp; it is used instead of the browser's cookies."""
+        if len(text.encode("utf-8", "replace")) > MAX_COOKIE_FILE:
+            raise ValueError("This file is too big for a cookies.txt")
+        summary = _cookie_summary(_parse_cookie_text(text))
+        if not summary["youtube"]:
+            raise ValueError("There are no YouTube cookies in this file. Open youtube.com, sign in, and export the "
+                             "cookies again from that tab")
+        path = _cookie_file()
+        _atomic_write(path, text)
+        os.chmod(path, 0o600)                         # it can sign in to the user's account
+        log.info("Imported a cookies file: %d cookies, %d for YouTube", summary["count"], summary["youtube"])
+        self._identity_changed("Cookies imported")
+        with self.cond:
+            self.version += 1
+        return cookie_file_status() or {}
+
+    def remove_cookies(self) -> bool:
+        try:
+            _cookie_file().unlink()
+        except FileNotFoundError:
+            return False
+        log.info("Removed the imported cookies file")
+        self._identity_changed("Cookies file removed")
+        with self.cond:
+            self.version += 1
+        return True
+
+    def _identity_changed(self, why: str):
+        """New cookies or a new proxy are what fix YouTube's block: try again at once instead of waiting."""
+        with self.cond:
+            hold = self._active_hold()
+            if (hold and hold.get("kind") in ("ratelimit", "cookies")) or self.rate_probe or self.rate_strikes:
+                self._clear_hold(probe=False, kinds=("ratelimit", "cookies"))
+                log.info("%s: rate-limit pause cleared", why)
 
     def _rate_for(self, running: int) -> float | None:
         """Speed limit for each download (bytes/s): the per-download limit, or an equal share of the total."""
@@ -1238,7 +1578,7 @@ class Manager:
             **it,
             "number": f"{number or it['index']:0{width}d}" if kind == "playlist" else "",
             "status": "new", "progress": 0.0, "speed": None, "eta": None,
-            "downloaded": 0, "total": None, "error": None, "attempts": 0, "net_attempts": 0,
+            "downloaded": 0, "total": None, "error": None, "attempts": 0, "net_attempts": 0, "rate_attempts": 0,
             "filepath": None, "next_try": 0, "rev": rev, "cancel": False,
             "options": {}, "outdir": outdir, "log": [], "priority": 0, "held": False, "history": [],
             "removed": bool(UNAVAILABLE_TITLE.match(it.get("title") or "")),
@@ -1277,8 +1617,8 @@ class Manager:
         """Put a video (back) in the queue. Every re-queue goes through here so a missing or damaged file is
         always dropped from the archive first (otherwise the video would just be "skipped" again)."""
         self._forget_file(job, item)
-        item.update(status="queued", error=None, attempts=0, net_attempts=0, next_try=0, cancel=False, held=False,
-                    **changes)
+        item.update(status="queued", error=None, attempts=0, net_attempts=0, rate_attempts=0, rate_first=None,
+                    next_try=0, cancel=False, held=False, **changes)
 
     def _forget_file(self, job: dict, item: dict):
         """Before re-downloading a video whose file was found missing or damaged, drop it from the archive."""
@@ -1302,13 +1642,36 @@ class Manager:
         log.log(logging.ERROR if level == "error" else logging.WARNING if level == "warning" else logging.INFO,
                 "[%s] %s", item["id"], msg)
 
-    def _hold_queue(self, reason: str, seconds: float):
+    def _hold_queue(self, reason: str, seconds: float, kind: str = "other"):
+        """Pause the whole queue (kind: ratelimit, cookies, disk, other). A longer pause replaces a shorter one."""
         with self.cond:
-            until = time.time() + seconds
+            now = time.time()
+            until = now + seconds
             if not self.hold or self.hold["until"] < until:
-                self.hold = {"reason": reason, "until": until}
+                old = self._active_hold()
+                since = old["since"] if old and old.get("kind") == kind else now
+                self.hold = {"reason": reason, "until": until, "kind": kind, "since": since}
                 self.version += 1
+                self._save_queue_state()
                 log.warning("Queue paused for %ds: %s", seconds, reason)
+
+    def _active_hold(self) -> dict | None:
+        return self.hold if self.hold and time.time() < self.hold["until"] else None
+
+    def _clear_hold(self, probe: bool, kinds: tuple[str, ...] | None = None):
+        """End the queue-wide pause (only one of these kinds, if given). probe=False also ends "one video first"
+        and forgets the rate-limit waves: used when the cookies or the proxy change, which is what fixes a block."""
+        with self.cond:
+            if kinds is None or (self.hold and self.hold.get("kind") in kinds):
+                self.hold = None
+            self.next_start = 0.0
+            if not probe:
+                self.rate_probe = False
+                self.rate_strikes = 0
+                self.rate_wave = 0.0
+            self._save_queue_state()
+            self.version += 1
+            self.cond.notify_all()
 
     def _wait_for_network(self) -> bool:
         return bool(self.settings.get("wait_for_network", True))
@@ -1316,6 +1679,8 @@ class Manager:
     def _limit(self) -> int:
         """Parallel downloads allowed right now: fewer on a weak connection so each one can finish."""
         c = self.settings["concurrency"]
+        if self.rate_probe:
+            return 1                                    # after rate limiting: see if one download works first
         if self._wait_for_network():
             level = self.net_level()
             if level == "weak":
@@ -1634,7 +1999,7 @@ class Manager:
     def _check_latest(self):
         version = None
         try:
-            with yt_dlp.YoutubeDL(_base_opts(self.settings)) as ydl:
+            with _ytdl(_base_opts(self.settings)) as ydl:
                 data = json.loads(ydl.urlopen("https://pypi.org/pypi/yt-dlp/json").read())
             version = data["info"]["version"]
         except Exception as exc:
@@ -1858,16 +2223,34 @@ class Manager:
             log.info("Cleaned up %d leftover files (%d bytes) of %r", len(files), size, job["title"])
         return {"files": len(files), "bytes": size, "names": [os.path.basename(p) for p in files[:50]]}
 
+    def _apply_options(self, job: dict, options: dict) -> str:
+        """Make these the playlist's options (used by Download and by auto-download of new videos). Takes
+        output_dir out of options; returns the folder."""
+        outdir = os.path.expanduser((options.pop("output_dir", "") or "").strip()) or job["outdir"]
+        problem = _folder_problem(outdir)
+        if problem:
+            raise OSError(problem)
+        job.update(outdir=outdir, options=dict(options))
+        return outdir
+
+    def set_options(self, job_id: str, options: dict) -> dict:
+        """The playlist's Save button: keep the options without queueing anything."""
+        with self.cond:
+            job = self.get(job_id)
+            options = dict(options)
+            options.pop("section", None)                 # a part is only ever for one download
+            self._apply_options(job, options)
+            self._touch(job)
+            log.info("Saved the options of %r: %s", job["title"], job["options"])
+            return {"options": dict(job["options"]), "outdir": job["outdir"]}
+
     def queue(self, job_id: str, ids: list[str] | None, options: dict) -> int:
         """Queue the chosen videos (all downloadable, not-downloaded ones when ids is None)."""
         with self.cond:
             job = self.get(job_id)
-            outdir = os.path.expanduser((options.pop("output_dir", "") or "").strip()) or job["outdir"]
             section = _parse_section(options.pop("section", None))
-            problem = _folder_problem(outdir)
-            if problem:
-                raise OSError(problem)
-            job.update(outdir=outdir, options=dict(options), paused=False)   # a part is only for this download
+            outdir = self._apply_options(job, options)   # a part is only for this download: not saved
+            job["paused"] = False
             if section:
                 options["section"] = section
             wanted = set(ids) if ids is not None else None
@@ -1901,7 +2284,7 @@ class Manager:
                 job["paused"] = False
             elif action == "retry":
                 job["paused"] = False
-                self.hold = None
+                self._clear_hold(probe=True)
                 for it in job["items"]:
                     if it["status"] == "failed" or (it["status"] == "queued" and it["next_try"] > time.time()):
                         self._requeue(job, it, rev=job["rev"] + 1)
@@ -2017,11 +2400,7 @@ class Manager:
 
     def clear_hold(self):
         """The "Try now" on a queue-wide pause (rate limit, disk full) once the user has fixed the cause."""
-        with self.cond:
-            self.hold = None
-            self.next_start = 0.0
-            self.version += 1
-            self.cond.notify_all()
+        self._clear_hold(probe=True)                     # still one video first after rate limiting
         log.info("Queue-wide pause cleared by the user")
 
     def retry_failed(self) -> int:
@@ -2367,6 +2746,7 @@ class Manager:
             "speed": sum(j["speed"] for j in jobs),
             "waiting": self.waiting_reason() if queued else None,
             "settings": self.settings,
+            "cookie_file": cookie_file_status(),
             "import": dict(self.importing) if self.importing else None,
             "last_event": self.last_event,
         }
@@ -2451,6 +2831,7 @@ class Manager:
                 "failed_today": day.get("failed", 0),
                 "waiting": reason,
                 "hold": hold,
+                "probe": self.rate_probe,
             },
         }
 
@@ -2562,7 +2943,7 @@ class Manager:
             self._set(job, item, status="skipped", progress=100.0, error=None)
             return
         if shutil.disk_usage(outdir).free < MIN_FREE_BYTES:
-            self._hold_queue("Disk almost full — free up space to continue", 60)
+            self._hold_queue("Disk almost full — free up space to continue", 60, "disk")
             self._set(job, item, status="queued", error="Waiting for free disk space")
             return
 
@@ -2654,7 +3035,7 @@ class Manager:
 
         try:
             for attempt in (1, 2):
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with _ytdl(opts) as ydl:
                     if options.get("metadata", True) and job["kind"] == "playlist":
                         ydl.add_post_processor(_PlaylistTags({"album": job["title"], "track": item["number"].lstrip("0")}),
                                                when="pre_process")
@@ -2709,12 +3090,19 @@ class Manager:
             if skip_existing:
                 self._archive_add(outdir, archive_key)
             self._set(job, item, status="done", progress=100.0, filepath=filepath, error=None, finished=time.time(),
-                      attempts=0, net_attempts=0, health="ok", checked=time.time(), file_problem=None,
+                      attempts=0, net_attempts=0, rate_attempts=0, rate_first=None, health="ok",
+                      checked=time.time(), file_problem=None,
                       media_duration=None if live else expected, section=section)
             self._item_log(job, item, "info", f"Done and verified: {os.path.basename(filepath)}")
             self._event(job, item, "done")
             with self.cond:
-                self.rate_strikes = 0
+                self.last_success = time.time()
+                if self.rate_strikes or self.rate_probe:     # it works again: back to normal
+                    self.rate_strikes, self.rate_probe = 0, False
+                    self.version += 1
+                    self.cond.notify_all()
+                    log.info("A download worked again after rate limiting: back to normal")
+                self._save_queue_state()
         except DownloadCancelled:
             # paused: back in the queue, the .part file resumes later. Stopped: back to "not downloaded".
             self._set(job, item, status="new" if item["cancel"] else "queued")
@@ -2733,18 +3121,45 @@ class Manager:
                 item.update(status="failed", error=msg)
 
             elif kind == "disk":
-                self._hold_queue("Disk is full — free up space to continue", 120)
+                self._hold_queue("Disk is full — free up space to continue", 120, "disk")
                 item.update(status="queued", error="Disk full — waiting for free space")
 
+            elif kind == "cookies":
+                # Every download would fail the same way: pause the queue until the cookie settings change.
+                browser = self.settings.get("cookies_browser") or ""
+                text = _cookie_error_text(browser, exc) if browser else f"{msg} — import the cookies file again"
+                self._hold_queue(text, COOKIE_HOLD, "cookies")
+                item.update(status="queued", error=text)
+
             elif kind == "ratelimit":
-                self.rate_strikes += 1
+                # Downloads running together hit the block together: that is one wave, one strike. A download
+                # that started before the last strike doesn't count again.
+                new_wave = (item.get("started") or now) >= self.rate_wave
+                if new_wave:
+                    self.rate_strikes += 1
+                    self.rate_wave = now
+                self.rate_probe = True                                   # afterwards: one video first
                 wait = min(60 * 2 ** (self.rate_strikes - 1), 1800)       # 1, 2, 4 … 30 min
-                self._hold_queue("YouTube is limiting requests — all downloads paused", wait)
-                item["net_attempts"] += 1
-                if item["net_attempts"] >= MAX_RATE_STRIKES:
-                    item.update(status="failed", error=f"{msg} — try “Use cookies from browser” in Settings")
+                bot = "not a bot" in msg.lower()
+                if self.rate_strikes >= RATE_BLOCK_STRIKES:
+                    reason = ("YouTube keeps asking to confirm you're not a bot" if bot else
+                              "YouTube keeps limiting requests") + \
+                             " — import cookies or use cookies from your browser, or change your VPN or proxy"
                 else:
-                    item.update(status="queued", error=f"YouTube is limiting requests — waiting {_fmt_secs(wait)}")
+                    reason = "YouTube is limiting requests — all downloads paused"
+                if new_wave or not self._active_hold():
+                    self._hold_queue(reason, wait, "ratelimit")
+                self._save_queue_state()
+                # Separate from net_attempts: connection problems don't use up this allowance.
+                item["rate_attempts"] = (item.get("rate_attempts") or 0) + 1
+                item["rate_first"] = item.get("rate_first") or now
+                # A block on every video keeps the queue paused; a video fails only if others download meanwhile.
+                alone = self.last_success > item["rate_first"]
+                if item["rate_attempts"] >= MAX_RATE_STRIKES and alone:
+                    item.update(status="failed",
+                                error=f"{msg} — other videos download, this one is still blocked; try cookies")
+                else:
+                    item.update(status="queued", error=f"YouTube is limiting requests — waiting: {msg}")
 
             elif kind == "network":
                 item["net_attempts"] += 1

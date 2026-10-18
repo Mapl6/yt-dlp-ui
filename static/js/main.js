@@ -7,7 +7,7 @@ import { initDialogs } from "./dialogs.js";
 import { initLibrary, markExpanded, openJob, renderLibrary } from "./library.js";
 import { initNet, renderNet } from "./netpanel.js";
 import { checkNotifications } from "./notify.js";
-import { initSettings, setSettings } from "./settings.js";
+import { importCookies, initSettings, openSettings, setCookieFile, setSettings } from "./settings.js";
 import { initShortcuts } from "./shortcuts.js";
 import { $, fmtSpeed, parseUrls, plural, titleFor, toast } from "./util.js";
 
@@ -17,6 +17,7 @@ let stream = null, pollTimer = null, lastOverview = null;
 function handle({ overview, activity }) {
   lastOverview = overview;
   setSettings(overview.settings);
+  setCookieFile(overview.cookie_file);
   renderNet(overview.net);
   $("#stat-active").textContent = `${overview.active} downloading`;
   $("#stat-speed").textContent = overview.active ? fmtSpeed(overview.speed) : "—";
@@ -32,7 +33,11 @@ function renderWait(overview, activity) {
   const wait = $("#wait-banner");
   const text = overview.waiting ? `⏸ ${overview.waiting}` : "";
   const hold = activity.stats.hold;
-  const html = text ? `<span></span>${hold ? `<button class="small" data-act="clear-hold" title="Use this once you've fixed the cause (freed disk space, changed the proxy…)">Try now</button>` : ""}` : "";
+  // YouTube's bot check and unreadable cookies are fixed by other cookies: offer them right here
+  const cookies = hold && ["ratelimit", "cookies"].includes(hold.kind)
+    ? `<button class="small" data-act="import-cookies" title="Load a cookies.txt exported from a browser where you're signed in to YouTube">Import cookies…</button>` +
+      `<button class="small" data-act="browser-cookies">Use cookies from browser…</button>` : "";
+  const html = text ? `<span></span><span class="wait-btns">${cookies}${hold ? `<button class="small" data-act="clear-hold" title="Use this once you've fixed the cause (freed disk space, changed the proxy…)">Try now</button>` : ""}</span>` : "";
   if (wait.dataset.html !== html) { wait.innerHTML = wait.dataset.html = html; }
   if (text) wait.firstChild.textContent = text;
   wait.classList.toggle("hidden", !text);
@@ -148,7 +153,10 @@ $("#links-file").addEventListener("change", async (e) => {
 });
 
 $("#wait-banner").addEventListener("click", async (e) => {
-  if (!e.target.closest('[data-act="clear-hold"]')) return;
+  const act = e.target.closest("[data-act]")?.dataset.act;
+  if (act === "import-cookies") return importCookies();
+  if (act === "browser-cookies") return openSettings("cookies");
+  if (act !== "clear-hold") return;
   await api("/api/queue/clear-hold", { method: "POST" }).catch((err) => toast(err.message));
   refresh();
 });

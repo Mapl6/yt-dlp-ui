@@ -133,9 +133,12 @@ function buildBody(view) {
     $$("[data-subs-only]", body).forEach((e) => e.classList.toggle("hidden", audio || !opt("subtitles").checked));
   };
   body.addEventListener("change", (e) => {
-    if (e.target.matches("[data-opt]")) { syncOptions(); estimate(view); }
+    if (e.target.matches("[data-opt]")) { syncOptions(); estimate(view); syncSave(view); }
   });
-  body.addEventListener("input", (e) => { if (e.target.matches('[data-opt="sec_start"], [data-opt="sec_end"]')) estimate(view); });
+  body.addEventListener("input", (e) => {
+    if (e.target.matches('[data-opt="sec_start"], [data-opt="sec_end"]')) estimate(view);
+    if (e.target.matches("[data-opt]")) syncSave(view);
+  });
   syncOptions();
 
   // automatic checks for new videos (saved right away)
@@ -180,6 +183,32 @@ function buildBody(view) {
   $('[data-role="filter"]', body).addEventListener("input", (e) => { view.text = e.target.value; relist(view); });
   view.el.appendChild(body);
   view.body = body;
+  view.savedOpts = optionsKey(view);
+  syncSave(view);
+}
+
+/** The options as the playlist stores them (a part of a video is only ever for one download). */
+const optionsKey = (view) => {
+  const { section, ...o } = collectOptions(view);
+  return JSON.stringify(o);
+};
+
+/** The Save button is enabled while the options differ from what the playlist has stored. */
+function syncSave(view) {
+  const changed = optionsKey(view) !== view.savedOpts;
+  $('[data-role="save-opts"]', view.body).disabled = !changed;
+  $('[data-role="opts-state"]', view.body).textContent = changed ? "Not saved — press Save options, or Download to use them" : "";
+}
+
+async function saveOptions(view) {
+  const { section, ...options } = collectOptions(view);
+  try {
+    await api(`/api/jobs/${view.id}/options`, { method: "PUT", body: { options } });
+    view.savedOpts = optionsKey(view);
+    toast("Options saved — Download and automatic downloads use them");
+  } finally {
+    syncSave(view);
+  }
 }
 
 function relist(view) {
@@ -383,6 +412,8 @@ async function startDownload(view) {
   view.selected.clear();
   view.vlist.draw();
   updateSelection(view);
+  view.savedOpts = optionsKey(view);              // Download stores the options too
+  syncSave(view);
   toast(`Queued ${plural(res.queued, "video")}`);
 }
 
@@ -426,6 +457,7 @@ async function onClick(e, view) {
     }
     if (role === "apply-range") return selectRange(view, $('[data-role="range"]', view.body).value);
     if (role === "download") { btn.disabled = true; await startDownload(view); return update(); }
+    if (role === "save-opts") { btn.disabled = true; await saveOptions(view); return update(); }
 
     if (btn.dataset.menu) {
       const it = view.items.get(btn.dataset.menu);

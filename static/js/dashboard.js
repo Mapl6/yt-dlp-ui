@@ -121,7 +121,9 @@ function render() {
 
   // tiles
   $("#dash-active").textContent = st.active;
-  $("#dash-active-sub").textContent = st.limit < st.concurrency ? `of ${st.limit} (reduced: weak connection)` : `of ${st.limit} at once`;
+  $("#dash-active-sub").textContent = st.limit >= st.concurrency ? `of ${st.limit} at once`
+    : st.probe ? `of ${st.limit} (one at a time until YouTube allows downloads again)`
+    : `of ${st.limit} (reduced: weak connection)`;
   $("#dash-queued").textContent = st.queued;
   $("#dash-queued-sub").textContent = st.queued ? `${st.ready} ready · ${st.queued - st.ready} waiting` : "nothing waiting";
   $("#dash-speed").textContent = st.active ? fmtSpeed(st.speed) : "—";

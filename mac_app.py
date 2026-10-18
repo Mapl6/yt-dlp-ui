@@ -207,7 +207,9 @@ def main():
                                    width=1180, height=880, min_size=(420, 520))
     state["window"] = window
     window.events.closing += on_closing
-    webview.start(on_started, (args.smoke,))
+    # Not private: pywebview's default forgets the page's storage (remembered tabs, filters) on every start.
+    from manager import DATA_DIR
+    webview.start(on_started, (args.smoke,), private_mode=False, storage_path=str(DATA_DIR / "webview"))
 
     # the window is gone: stop the web server and save the library
     state["quitting"] = True

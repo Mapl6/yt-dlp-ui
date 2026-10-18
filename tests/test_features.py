@@ -460,7 +460,7 @@ if sys.platform == "darwin":
 fetches = {"n": 0}
 def fake_inspect(url, settings):
     fetches["n"] += 1
-    ids = ["s1", "s2"] + (["s3"] if fetches["n"] > 1 else [])
+    ids = ["s1", "s2"] + (["s3"] if fetches["n"] > 1 else []) + (["s4"] if fetches["n"] > 2 else [])
     return {"kind": "playlist", "source_id": "subs", "title": "List subs", "thumbnail": None, "heights": [360],
             "items": [{"index": i + 1, "id": v, "title": f"Video {v}", "url": f"test://{v}", "duration": 30,
                        "extractor": "Test"} for i, v in enumerate(ids)]}
@@ -491,6 +491,36 @@ check("sync: new video queued automatically", sub_items["s3"]["status"] == "queu
       and sub_items["s1"]["status"] == "new", {k: v["status"] for k, v in sub_items.items()})
 check("sync: paused playlist stays paused", jsub["paused"])
 check("sync: last check recorded", time.time() - jsub["sync"]["last"] < 5)
+mgr.pause_all(False)
+mgr.action(jsub["id"], "stop")
+level["v"] = "offline"
+
+# ---------- a playlist's Save button: options kept without queueing anything, and used by auto-download
+saved_dir = out / "saved"
+r = mgr.set_options(jsub["id"], dict(OPTS, quality="720", sponsorblock="mark", output_dir=str(saved_dir),
+                                     section={"start": "0:05", "end": ""}))
+check("save options: stored without queueing", jsub["options"]["quality"] == "720"
+      and jsub["options"]["sponsorblock"] == "mark" and jsub["outdir"] == str(saved_dir) and saved_dir.is_dir()
+      and not any(i["status"] == "queued" for i in jsub["items"]), (jsub["options"], jsub["outdir"]))
+check("save options: a part of a video and the folder aren't stored as options",
+      "section" not in jsub["options"] and "output_dir" not in jsub["options"], jsub["options"])
+if sys.platform == "darwin":
+    try:
+        mgr.set_options(jsub["id"], dict(OPTS, output_dir="/Volumes/No Such Drive ytdl/x"))
+        refused = False
+    except OSError:
+        refused = True
+    check("save options: a folder on an unplugged drive is refused, nothing changes",
+          refused and jsub["outdir"] == str(saved_dir) and jsub["options"]["quality"] == "720")
+with mgr.cond:
+    jsub["sync"]["last"] = time.time() - 7 * 3600
+level["v"] = "good"
+mgr.pause_all(True)
+mgr.sync_due()
+s4 = items_of(jsub).get("s4") or {}
+check("save options: auto-download of a new video uses the saved options",
+      s4.get("status") == "queued" and (s4.get("options") or {}).get("quality") == "720"
+      and s4.get("outdir") == str(saved_dir), (s4.get("status"), s4.get("options"), s4.get("outdir")))
 mgr.pause_all(False)
 mgr.action(jsub["id"], "stop")
 level["v"] = "offline"
@@ -623,6 +653,64 @@ check("import data: check finds files, confirms done ones, flags missing ones",
       fi["have1"]["status"] == "skipped" and fi["kept1"]["status"] == "done" and fi["kept1"]["health"] == "ok"
       and fi["gone1"]["status"] == "failed" and fi["gone1"].get("file_problem") and fi["todo1"]["status"] == "new",
       {k: (v["status"], v.get("file_problem")) for k, v in fi.items()})
+
+# ---------- every setting survives Save and a reload ("Desktop notifications" came back unticked)
+before = dict(m2.settings)
+values = {"output_dir": str(TMP / "elsewhere"), "concurrency": 5, "cookies_browser": "firefox",
+          "cookies_profile": "abc.default-release", "rate_limit_mb": 1.5, "sleep_between": 3.0,
+          "proxy": "http://127.0.0.1:9", "wait_for_network": False, "total_rate_mb": 4.0, "schedule_on": True,
+          "schedule_start": "02:30", "schedule_end": "06:15", "sub_langs": "en, fa", "notify": True}
+check("settings: the round-trip covers every setting", set(values) == set(M.DEFAULT_SETTINGS),
+      set(M.DEFAULT_SETTINGS) ^ set(values))
+check("settings: every test value differs from its default", all(values[k] != M.DEFAULT_SETTINGS[k] for k in values))
+saved = m2.update_settings(values)
+reread = M._coerce_settings(json.loads(M.SETTINGS_FILE.read_text()))
+check("settings: every value saved and read back unchanged", saved == values and reread == values,
+      {k: (saved.get(k), reread.get(k)) for k in values if saved.get(k) != values[k] or reread.get(k) != values[k]})
+check("settings: sent to the page", m2.overview()["settings"]["notify"] is True)
+m2.update_settings(before)
+
+# ---------- import a cookies.txt (Netscape format), remove it again
+NETSCAPE = ("# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc\n"
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\txyz\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tother\t1\n")
+for bad, why in (("hello, these are not cookies", "not cookies.txt"),
+                 (".example.com\tTRUE\t/\tFALSE\t0\tother\t1\n", "no YouTube cookies")):
+    try:
+        m2.import_cookies(bad)
+        check(f"cookies file: refuses {why}", False)
+    except ValueError:
+        check(f"cookies file: refuses {why}", not M._cookie_file().exists())
+m2._hold_queue("YouTube is limiting requests", 600, "ratelimit")
+m2.rate_probe = True
+st = m2.import_cookies(NETSCAPE)
+check("cookies file: imported with counts", st.get("youtube") == 2 and st.get("count") == 3 and st.get("signed_in")
+      and m2.overview()["cookie_file"]["youtube"] == 2, st)
+check("cookies file: readable only by the user", (M._cookie_file().stat().st_mode & 0o077) == 0,
+      oct(M._cookie_file().stat().st_mode))
+check("cookies file: importing ends the rate-limit pause at once", m2.hold is None and not m2.rate_probe, m2.hold)
+seen = []
+real_ydl = M.yt_dlp.YoutubeDL
+class SpyYDL(real_ydl):
+    def __init__(self, params=None, *a, **k):
+        seen.append(dict(params or {}))
+        super().__init__(params, *a, **k)
+M.yt_dlp.YoutubeDL = SpyYDL
+try:
+    opts = M._base_opts({"cookies_browser": "chrome"})
+    with M._ytdl(opts) as y1, M._ytdl(opts) as y2:
+        paths = [y1.params.get("cookiefile"), y2.params.get("cookiefile")]
+        copies_ok = all(p and Path(p).read_text() == NETSCAPE for p in paths)
+finally:
+    M.yt_dlp.YoutubeDL = real_ydl
+check("cookies file: each download gets its own copy (yt-dlp writes cookies back)",
+      paths[0] != paths[1] and copies_ok and all(p != str(M._cookie_file()) for p in paths), paths)
+check("cookies file: used instead of the browser's cookies", all("cookiesfrombrowser" not in s for s in seen), seen)
+check("cookies file: copies removed afterwards", not any(Path(p).exists() for p in paths))
+check("cookies file: never in the data export", "SAPISID" not in json.dumps(m2.export_data()))
+check("cookies file: removed", m2.remove_cookies() and not M._cookie_file().exists()
+      and m2.overview()["cookie_file"] is None)
 
 srv.shutdown()
 print("\nALL PASSED" if ok else "\nSOME FAILED")

@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from manager import AlreadyRunning, Manager, _clean_error
+from manager import AlreadyRunning, Manager, _clean_error, check_cookies, cookie_sources
 from netcheck import NetMonitor
 
 STATIC = Path(__file__).parent / "static"
@@ -108,6 +108,15 @@ class ImportRequest(BaseModel):
 
 class OpenManyRequest(BaseModel):
     urls: list[str]
+
+
+class CookieFileRequest(BaseModel):
+    text: str
+
+
+class CookieTestRequest(BaseModel):
+    browser: str
+    profile: str = ""
 
 
 @app.middleware("http")
@@ -273,6 +282,32 @@ def settings(patch: dict):
     return result
 
 
+@app.get("/api/cookies/sources")
+def cookies_sources():
+    """Browsers on this computer that cookies can be read from, with their profiles."""
+    return {"browsers": cookie_sources()}
+
+
+@app.post("/api/cookies/test")
+def cookies_test(req: CookieTestRequest):
+    """Read the chosen browser's cookies now (macOS may ask for the keychain password)."""
+    return check_cookies(req.browser.strip(), req.profile.strip())
+
+
+@app.post("/api/cookies/file")
+def cookies_import(req: CookieFileRequest):
+    """Save a cookies.txt (Netscape format) exported from a browser; downloads use it instead of the browser."""
+    try:
+        return manager.import_cookies(req.text)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/cookies/file")
+def cookies_remove():
+    return {"removed": manager.remove_cookies()}
+
+
 @app.get("/api/export")
 def export_all():
     """Everything in one JSON file: settings, every playlist with its videos, and the download history."""
@@ -354,6 +389,17 @@ def download(job_id: str, req: DownloadRequest):
         raise HTTPException(404, "Playlist not found")
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+    except OSError as exc:
+        raise HTTPException(400, f"Can't use that folder: {exc.strerror or exc}")
+
+
+@app.put("/api/jobs/{job_id}/options")
+def job_options(job_id: str, req: DownloadRequest):
+    """The playlist's Save button: store its options without queueing anything."""
+    try:
+        return manager.set_options(job_id, dict(req.options))
+    except KeyError:
+        raise HTTPException(404, "Playlist not found")
     except OSError as exc:
         raise HTTPException(400, f"Can't use that folder: {exc.strerror or exc}")
 
