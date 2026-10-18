@@ -18,10 +18,10 @@ Requires Python 3.10+, `ffmpeg` (`brew install ffmpeg`), and a JS runtime — de
 
 1. **Paste a playlist link and press Add.** The whole playlist (every video) is saved to your library. Nothing downloads yet.
 2. **Open the playlist and choose videos:** tick them, use *Select not downloaded*, type a range like `1-50, 80, 100-`, filter by title or length, or sort by title, length, status or download date. Playlists with thousands of videos stay fast: only the rows on screen are drawn.
-3. **Pick a quality and press Download.** Next to the button you see the estimated size of the selection and the free space on that drive. Each video shows its state: Not downloaded → Queued → Downloading → Processing (merging, verifying…) → Downloaded.
+3. **Pick a quality and press Download.** Next to the button you see the estimated size of the selection and the free space on that drive. Each video shows its state: Not downloaded → Queued → Downloading → Processing (merging, verifying…) → Downloaded. To keep the options (quality, format, folder, subtitles, sponsor segments…) without downloading anything, press **Save options**; it lights up when something changed.
 4. **Come back any time.** The library and every video's progress are saved in `data/library.db` (an older `data/state.json` is moved in automatically on first start). Close the app, restart the Mac, add more videos later; the playlist keeps track.
 5. **Add the same link again** (or press *Check for new videos*) to pull in videos added to the playlist since. Everything you already have stays marked as downloaded. The list follows the playlist's new order, but files keep their numbers, and new videos get the next free number. Videos that left the playlist or became private/deleted are marked **Unavailable** and are skipped by *Select not downloaded*.
-6. **Let it check by itself.** In an opened playlist, *Check for new videos* can run every 6 or 12 hours, daily or weekly, and *Download new videos automatically* queues what it finds with the playlist's last options (a paused playlist stays paused). Checks wait while you're offline.
+6. **Let it check by itself.** In an opened playlist, *Check for new videos* can run every 6 or 12 hours, daily or weekly, and *Download new videos automatically* queues what it finds with the playlist's saved options (from **Save options** or the last Download) (a paused playlist stays paused). Checks wait while you're offline.
 
 To add many links at once, paste them all into the link box (one per line or separated by spaces) or press **Import .txt** and pick a text file; they are added one after another and the progress shows under the box.
 
@@ -71,21 +71,21 @@ The **Activity** panel shows every playlist at once. It updates live (the server
 - Click a row (or its arrow) for the details: the chosen and the actual format, folder and file name, every attempt with its kind of error, and the log.
 - Filter the lists by playlist or search titles.
 
-Video titles link to YouTube. Playlist names jump to that playlist below. When the whole queue is paused (rate limiting, disk full), the banner has a **Try now** button for when you have fixed the cause. The browser tab shows the progress (`↓3 · 42% — YT Downloader`), and Settings can turn on **desktop notifications** when a playlist finishes or a video fails.
+Video titles link to YouTube. Playlist names jump to that playlist below. When the whole queue is paused (rate limiting, disk full), the banner has a **Try now** button for when you have fixed the cause; when YouTube asks to confirm you're not a bot, it also offers **Import cookies…** and **Use cookies from browser…**. The browser tab shows the progress (`↓3 · 42% — YT Downloader`), and Settings can turn on **desktop notifications** when a playlist finishes or a video fails.
 
 ## Settings (⚙)
 
 | Setting | Use |
 |---|---|
 | Parallel downloads | 3 is a safe default; going higher risks YouTube rate limits |
-| Cookies from browser | For age-restricted or members-only videos, or a "confirm you're not a bot" error |
+| Cookies | For age-restricted or members-only videos, or a "confirm you're not a bot" error. Pick a browser and profile from the ones found on this computer (including Arc and Chrome Canary); **Test cookies** checks that they can be read and that you're signed in. Or **Import cookies…** a `cookies.txt` exported from a signed-in YouTube tab with a browser extension; while one is imported it is used instead of the browser. macOS may ask for your password to read a browser's cookies (choose *Always Allow*), and Safari needs Full Disk Access for the app that runs YT Downloader |
 | Proxy | `socks5://127.0.0.1:1080` etc., if YouTube is blocked on your network |
 | Pause between videos | 2–5 s helps with playlists of hundreds of videos |
 | Wait while offline | On by default: the queue pauses while offline and uses fewer parallel downloads on a weak connection |
 | Speed limit per download / total | The total limit is shared by the downloads running at the moment |
 | Download schedule | Only start downloads between two times (e.g. 01:00–07:00, also across midnight). A video already downloading finishes |
 | Subtitle languages | The default for new downloads |
-| Desktop notifications | When a playlist finishes downloading or a video fails |
+| Desktop notifications | When a playlist finishes downloading or a video fails. Saved with the other settings, so the choice is the same in every browser and in the Mac app |
 | yt-dlp | Shows the version in use and whether a newer one exists. **Update now** installs it; **Restart now** restarts the app to use it (interrupted downloads continue) |
 
 **Keyboard shortcuts:** `/` search playlists, `u` link box, `p` pause/resume all, `1`–`4` dashboard tabs, `s` settings, `?` list of shortcuts.
@@ -104,6 +104,7 @@ Downloads are built so that nothing is lost when the connection drops:
 - **Adapts to a weak connection.** On a "Weak" connection only one video downloads at a time, on "Fair" at most two, so each one can finish.
 - **Every file is checked.** Each downloaded stream must be exactly the size YouTube reports, and the separate video and audio streams are kept until the merged file passes the check — a bad merge is redone from them instead of downloading again. A video only counts as downloaded after the file's length is compared with the video's and its last seconds are decoded. A cut-off file is deleted and downloaded again. Missing pieces of a stream fail the download instead of leaving gaps.
 - **Queue-wide pauses.** If the disk is full, an external drive is unplugged, or YouTube starts rate-limiting, all downloads pause with a banner explaining why, instead of failing one by one.
+- **Gentle with YouTube's bot check.** Downloads blocked together count as one strike; the pause grows 1, 2, 4… up to 30 minutes per wave and is kept across restarts. After a pause one video goes first, and the others follow only once it works. A block on every video never fails them (only a video that stays blocked while others download does), and after a few waves the banner says what to change. New cookies or a new proxy end the pause at once. Browser cookies that can't be read pause the queue once with the reason (for example, Full Disk Access) instead of retrying each video.
 - **Safe library.** The library is a SQLite database that survives crashes and power loss, and each save writes only what changed. A backup is made every 10 minutes; a damaged database is kept aside and the backup is loaded.
 - **No double downloads.** Only one copy of the app can use a library, and a video locked by another copy (for example, a second library saving to the same folder) waits instead of writing the same file twice.
 

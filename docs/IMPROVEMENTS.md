@@ -1,17 +1,57 @@
 # YT Downloader — Improvement Plan
 
-Last updated 2026-10-17. Open work first; finished work is summarized at the end.
+Last updated 2026-10-18. Open work first; finished work is summarized at the end.
 
 ## Next up
 
-1. **Docker image** for a home server or NAS. The network-mode password it needed now exists (`--password` / `YTDL_PASSWORD`).
-2. **Browser extension or bookmarklet:** "Send to YT Downloader" from a YouTube page (it can post to `/api/open-many`).
+In this order, on a branch from `main`. A full test suite is the safety net for moving code around, so 1 comes first; restructuring without it risks the invariants in `.claude/rules/download-core.md`.
+
+### 1. Complete tests for backend and front end
+
+Backend (most important):
+
+- Move to pytest (with a selector, and fixtures for a scratch data dir, the local flaky HTTP server, the fake extractor and an API client with the token), keeping every current check.
+- Cover every API route: token, Host guard, password login and its rate limit, error responses.
+- Cover every item status change and every re-queue path (`_requeue`, `_forget_file`).
+- Cover the invariants: the archive line is written only after verification; never the same video twice at once; nothing lost after a crash or a damaged database; files only deleted when their `[id]` matches.
+- Cover settings save and load for every field, the rate-limit and cookie handling, export/import and sync.
+- Measure coverage and set a minimum.
+
+Front end:
+
+- Unit tests (e.g. Vitest) for the formatters, filters, range selector and stats, replacing `tests/test_ui.mjs`.
+- End-to-end tests (Playwright) against a test server on a scratch data dir: add a playlist, select and download, pause/resume, change and save settings, playlist Save options, the rate-limit banner, export/import. Select elements by role and label so the same tests check the Next.js port (3).
+
+Run everything with one command (and the `run-tests` skill), and in CI on every push (macOS and Ubuntu with ffmpeg, plus Windows — see open issues).
+
+### 2. Restructure the backend; separate front and back end
+
+- Folders `backend/` and `frontend/`. The library stays in `<repo>/data/`.
+- Split `manager.py` (about 3,000 lines) into modules: config and paths, error kinds, settings, store (SQLite and backups), yt-dlp options and loggers, verification, files (archive, locks), cookies, and the `Manager` split by area (scheduler and queue, download pipeline, file health, sync, event log, file actions, export/import).
+- Split `server.py` into FastAPI routers. Keep the rule that specific job routes come before `POST /api/jobs/{job_id}/{action}`, with a test for it.
+- Move one piece at a time, with every test suite passing after each move; no behaviour changes in the same step.
+- One script still starts everything: `run.sh` / `run.bat` / `run.ps1` / `run-mac.sh` start the backend and, in dev mode, the front-end dev server, and stop both on Ctrl+C. `python server.py` keeps working (restart and the Mac app use it).
+- Update `CLAUDE.md`, the `.claude/rules/` paths and the skills (`safe-test-server`, `run-tests`).
+
+### 3. Move the front end to Next.js
+
+- Port `static/js/` (about 3,500 lines of ES modules) to Next.js with React, one module at a time: shared logic (API client and live updates, formatters, filters, stats), dialogs and menus, Settings, network panel, dashboard and charts, library cards with the virtual list, notifications and shortcuts.
+- Keep what the page does now: live updates over `/api/stream` with polling as a fallback, `items?since=rev`, updates that never lose a click, keyboard shortcuts, phone layout, dark mode.
+- Build to static files (`output: "export"`) and **commit the build**, so users still need only Python, it works offline, and the Mac app needs no change. CI checks the committed build is current.
+- The backend keeps injecting the `X-Token` into the exported `index.html`. For development, `next dev` proxies `/api` to the backend, which then offers the token on a dev-only route.
+- Serve the new page beside the old one until the end-to-end tests pass on both, then switch and delete `static/`.
+
+### Later
+
+- **Docker image** for a home server or NAS (the network-mode password exists: `--password` / `YTDL_PASSWORD`).
+- **Browser extension or bookmarklet:** "Send to YT Downloader" from a YouTube page (it can post to `/api/open-many`).
 
 ## Open issues
 
 | Issue | Fix |
 | --- | --- |
-| **Windows is untested.** `run.bat`, `run.ps1` and the `msvcrt` file locks were only checked for syntax on macOS. | Run the test suites on a Windows machine. |
+| **Windows is untested.** `run.bat`, `run.ps1` and the `msvcrt` file locks were only checked for syntax on macOS. | Run the test suites on a Windows machine (or in CI). |
+| **Arc and Chrome Canary cookies rely on a private yt-dlp function.** `_register_extra_browsers` wraps `yt_dlp.cookies._get_chromium_based_browser_settings`; if yt-dlp renames it, those browsers silently disappear from Settings. | A check in the test suite after each yt-dlp update; `cookies.txt` import still works. |
 | **The Mac app's menu-bar icon is only checked by hand.** `mac_app.py --smoke` covers the window, the page and creating the icon, not clicking its menu. | A UI test with the Accessibility API, or keep checking by hand after changes. |
 | **The total speed limit is per connection.** A fragmented stream (HLS/DASH) downloads 4 fragments at once, each allowed the full share, so it can briefly go over the total. | Divide the share by `concurrent_fragment_downloads` for fragmented formats. |
 | **Logins don't survive a restart.** Password sessions are kept in memory, so after a restart (or a yt-dlp update) every browser logs in again. | Signed session cookies with a key stored in `data/`. |
@@ -23,88 +63,33 @@ Last updated 2026-10-17. Open work first; finished work is summarized at the end
 - Notifications for queue-wide pauses (rate limiting, disk full), not only finished playlists and failed videos.
 - A "Downloaded" badge on the Mac app's Dock icon.
 
-## Done (2026-10-17)
+## Done
 
-The roadmap from 2026-10-16, apart from Docker and the browser extension. Five commits on `feature/roadmap`: core, queue control, download options, server, front end; plus the Mac app and these docs.
+### 2026-10-18: YouTube's bot check, cookies, settings
 
-### Queue control
+From the 2026-10-17 incident in `data/app.log` (the "confirm you're not a bot" block from 20:12 and the Chrome cookie error at 23:38):
 
-- Move a video to the top or bottom of the queue, or drag it in the dashboard (`priority`, then playlist age and order).
-- Pause and resume one video (`held`); a running one stops and keeps its `.part` file.
-- **Try now** for a video waiting on a retry, and on the queue-wide pause banner.
-- **Pause all / Resume all**, **Retry all failed**.
+- **Rate limiting:**
+  - downloads blocked together count as one strike, so the pause no longer jumps from 4 to 30 minutes in a second;
+  - the pause and strike count survive restarts (`data/queue_state.json`);
+  - rate-limit errors have their own counter, and a block on every video keeps the queue paused instead of failing videos one by one;
+  - after a pause one video goes first;
+  - new cookies or a new proxy end the pause at once;
+  - after three waves the banner says what to change.
+- **Cookies:**
+  - Settings lists the browsers and profiles found on this computer (adds Arc and Chrome Canary; flags Full Disk Access);
+  - **Test cookies**;
+  - **Import cookies…** for a `cookies.txt` (used instead of the browser, a private copy per download);
+  - a cookie error pauses the queue once with the reason;
+  - the bot-check banner offers **Import cookies…** and **Use cookies from browser…**.
+- **Desktop notifications** are a saved setting (they were kept in browser storage, lost in the Mac app and refused by Safari without a click). The Mac app keeps its page storage. A test saves and reloads every setting.
+- **Save options** button for a playlist; auto-download of new videos uses the saved options.
+- No more "ERROR: ERROR:" in the Details log.
 
-### Dashboard and history
+### 2026-10-17: roadmap phase 5
 
-- Event log (SQLite `events` table) of finished and failed downloads with size and time; earlier downloads are added once from their files. "Recently finished" reads it, with paging and **Clear** (hides rows; stats keep them).
-- **History & stats** tab: data per day or week, success rate, average speed, most common error kinds, with a table view.
-- Tiles for time left (queue size from known sizes or duration × bitrate, and the last two minutes' speed) and free disk space per drive; a speed chart.
-- Expandable rows: chosen and actual format, folder and file, attempts with error kinds, and the log.
-- Processing sub-steps (Merging, Verifying, Embedding thumbnail, Re-merging…).
-- Filter by playlist and search; totals ignore the filter. The panel folds away when idle.
-- Tab title progress, desktop notifications (finished playlist, failed video), keyboard shortcuts.
+Mac app (window and menu-bar icon); dashboard with history and stats, speed chart, time left and free disk space; queue control (reorder, per-video pause, try now, pause all, retry all failed); subscriptions; SponsorBlock; subtitle languages; parts of videos; adding many links; download schedule and shared speed limit; per-video file actions; remove with files; `.m3u` export; yt-dlp update and restart; export and import of all data; live updates over SSE; virtual scrolling; ES-module front end; optional password for network mode; Windows launchers.
 
-### Downloads and library
+### 2026-10-16: reliability and security
 
-- Subscriptions: check saved playlists every 6/12/24 h or weekly, optionally queueing new videos.
-- SponsorBlock: mark or cut segments; a SponsorBlock outage never fails a download.
-- Subtitle languages, including auto-generated ones.
-- Download only part of a video (own file name, never archived). Cut and partial files are verified against their real length (`media_duration`), also by Check files.
-- Paste many links or import a `.txt` file; estimated size and free space before queueing.
-- Download schedule and a total speed limit shared by running downloads (applied to downloads in progress).
-- Per-video Show in Finder, Play, Delete file, Mark as downloaded; remove a playlist together with its files; export `.m3u8`.
-- yt-dlp version check, **Update now** and **Restart now**.
-
-### Export and import all data
-
-- Settings → **Export all data** / **Import…**: one JSON file with settings, every playlist and video, and the event log. Import merges (adds missing playlists, videos and history; never deletes), keeps every video's state (queued ones continue), runs Check files on the imported playlists one at a time, and only applies the file's settings when the user agrees. The page gets `?v=<mtime>` on its scripts and `/static/*` is served `no-cache`, so an update never runs stale JavaScript. `GET /api/export`, `POST /api/import`; checks in `tests/test_features.py`.
-
-### Platform and code quality
-
-- Live updates over Server-Sent Events (`/api/stream`), polling as a fallback. `/api/activity` and the scheduler read an index of queued and active videos instead of scanning every video.
-- Virtual scrolling in playlist cards; `app.js` split into ES modules under `static/js/` (no build step).
-- Check files decodes a file fully before calling it damaged.
-- Optional password for network mode (login page, session cookie, rate limit).
-- `fastapi` and `uvicorn` pinned; `run.bat` / `run.ps1`; file locks on Windows.
-- Optional Mac app: `mac_app.py`, `run-mac.sh`, `scripts/make_mac_app.sh`.
-- Tests: `tests/test_features.py` (Python) and `tests/test_ui.mjs` (page logic, run with Node), next to the three existing suites.
-
-## Done (2026-10-16)
-
-### Security and correctness
-
-- The API only answers `127.0.0.1`/`localhost`, and every call needs a per-session token (blocks DNS rebinding and requests from other sites).
-- Settings are validated; bad values fall back to defaults.
-- Playlist refresh: the list follows the playlist's order, file numbers are permanent, and new videos get the next free number with no extra digits. Videos that leave the playlist or become private are marked **Unavailable**; a cut-short fetch doesn't mark anything.
-- Errors are classified by yt-dlp exception type and HTTP status, with message text only as a fallback.
-- Every change to a video goes through the lock.
-
-### Download reliability (weak internet)
-
-- Interrupted downloads resume from their `.part` file; missing stream pieces fail the download instead of leaving gaps.
-- Connection problems are retried with growing pauses (up to 40 times) without using up the normal retries. The queue waits while offline and runs fewer downloads on a weak connection.
-- Disk full, an unplugged drive or YouTube rate limiting pause the whole queue, with a banner explaining why.
-- The pause between videos no longer takes a download slot; `run.sh` starts even when offline.
-
-### File integrity
-
-- Each stream must match the exact size the site reports, and every finished file is checked (length, plus decoding its last seconds) before it counts as downloaded.
-- Separate video/audio streams are kept until the merged file passes the check; a bad merge is redone from them without downloading again.
-- **Check files** button: verifies existing downloads, renames damaged files to `.damaged`, flags missing ones and adopts good files already in the folder. "Check for new videos" also flags files that have disappeared.
-- **Clean up leftovers** button: deletes partial downloads, unmerged streams and `.damaged` files after showing the list.
-
-### Activity dashboard
-
-- **Activity** panel across all playlists, backed by `GET /api/activity`.
-  - Totals: downloading out of the current limit, queued (ready or waiting), total speed and data left, done and failed in the last 24 hours.
-  - **Downloading now** tab: progress, size, speed, time left, start time and attempt number for each video.
-  - **Up next** tab: the queue in scheduler order, with why each video is waiting.
-  - **Recently finished** tab: with Retry and Details.
-- Videos now record `started` and `finished` times.
-
-### Storage, logging, safety
-
-- The library is in SQLite (`data/library.db`); each save writes only what changed. It's backed up at startup and every 10 minutes, and a damaged database is kept aside while the backup is loaded. `state.json` is migrated automatically.
-- `data/app.log` (rotating) plus a **Details** button per video.
-- Only one copy of the app can use a library; it refuses to start if its port is taken; a per-video lock stops two copies from writing the same file.
-
+Token and Host checks on the API; validated settings; stable file numbers and Unavailable videos on refresh; error kinds from exception types; resume and backoff on weak internet with queue-wide pauses; every file checked (stream sizes, length, decoding the end) before it counts as downloaded, with re-merge from kept streams; Check files and Clean up leftovers; the first Activity dashboard; SQLite library with backups and recovery; app log and Details; single instance and per-video locks.
