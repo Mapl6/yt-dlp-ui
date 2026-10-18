@@ -1,0 +1,717 @@
+"""Run: .venv/bin/python tests/test_features.py   (needs ffmpeg; no internet required)
+
+Feature tests: scheduler index and priorities, per-video pause, the event log (history and stats),
+processing sub-steps and format notes, queue controls, schedule and speed limits, file actions,
+playlist removal with files, .m3u export, the second opinion before calling a file damaged, subtitle
+languages, SponsorBlock, parts of videos, size estimates, subscriptions, adding many links, yt-dlp updates.
+"""
+import http.server, json, os, shutil, socketserver, sqlite3, subprocess, sys, tempfile, threading, time
+from pathlib import Path
+
+ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent
+TMP = Path(tempfile.mkdtemp(prefix="ytdl-features-"))
+os.environ["YTDL_DATA_DIR"] = str(TMP / "data")
+sys.path.insert(0, str(ROOT))
+import manager as M
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
+
+ok = True
+def check(name, cond, extra=""):
+    global ok
+    ok &= bool(cond)
+    print(("PASS " if cond else "FAIL ") + name, "" if cond else extra)
+
+def wait(cond, timeout=60):
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.2)
+    return False
+
+# ---------- media and a local server for it (Range support, optional throttling)
+media = TMP / "media"; media.mkdir()
+def ff(*args):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *args], check=True)
+ff("-f", "lavfi", "-i", "testsrc=size=640x360:rate=25", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "30",
+   "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-movflags", "+faststart", str(media / "full.mp4"))
+ff("-i", str(media / "full.mp4"), "-an", "-c", "copy", str(media / "v.mp4"))
+ff("-i", str(media / "full.mp4"), "-vn", "-c", "copy", str(media / "a.m4a"))
+GOOD = (media / "full.mp4").read_bytes()
+
+throttle = {"on": False}
+class Media(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        data = (media / self.path.lstrip("/")).read_bytes()
+        start, end = 0, len(data) - 1
+        rng = self.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            a, _, b = rng[6:].partition("-")
+            start, end = int(a), int(b) if b else len(data) - 1
+        body = data[start:end + 1]
+        self.send_response(206 if rng else 200)
+        self.send_header("Content-Length", str(len(body))); self.send_header("Accept-Ranges", "bytes")
+        if rng: self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.end_headers()
+        try:
+            for i in range(0, len(body), 16384):
+                self.wfile.write(body[i:i + 16384])
+                if throttle["on"]:
+                    time.sleep(0.2)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+class TS(socketserver.ThreadingMixIn, http.server.HTTPServer): daemon_threads = True
+srv = TS(("127.0.0.1", 0), Media); port = srv.server_address[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+FAIL_IDS = set()                         # ids whose extraction fails like a private video
+def fake_info(vid, url):
+    return {"id": vid, "title": f"Video {vid}", "extractor": "test", "extractor_key": "Test", "webpage_url": url,
+            "duration": 30, "formats": [
+        {"format_id": "137", "url": f"http://127.0.0.1:{port}/v.mp4", "ext": "mp4", "vcodec": "avc1.4d401e",
+         "acodec": "none", "width": 640, "height": 360, "filesize": (media / "v.mp4").stat().st_size, "protocol": "http"},
+        {"format_id": "140", "url": f"http://127.0.0.1:{port}/a.m4a", "ext": "m4a", "vcodec": "none",
+         "acodec": "mp4a.40.2", "filesize": (media / "a.m4a").stat().st_size, "protocol": "http"}]}
+real_extract = YoutubeDL.extract_info
+def extract(self, url, download=True, *a, **k):
+    if str(url).startswith("test://"):
+        vid = str(url)[7:]
+        if vid in FAIL_IDS:
+            raise DownloadError("ERROR: [test] %s: Private video. Sign in if you've been granted access" % vid)
+        return self.process_ie_result(fake_info(vid, url), download=download)
+    return real_extract(self, url, download, *a, **k)
+YoutubeDL.extract_info = extract
+
+mgr = M.Manager()
+out = TMP / "out"; out.mkdir()
+mgr.update_settings({"output_dir": str(out), "concurrency": 2})
+level = {"v": "offline"}                 # keep workers idle until a test wants them
+mgr.net_level = lambda: level["v"]
+OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": False, "numbering": False,
+        "output_dir": str(out)}
+
+def make_job(name, ids, created=None):
+    with mgr.cond:
+        job = mgr._create(f"test://list-{name}", {
+            "kind": "playlist", "source_id": name, "title": f"List {name}", "thumbnail": None, "heights": [360],
+            "items": [{"index": i + 1, "id": v, "title": f"Video {v}", "url": f"test://{v}", "duration": 30,
+                       "extractor": "Test"} for i, v in enumerate(ids)]})
+        job["outdir"] = str(out)
+        for it in job["items"]:
+            it["outdir"] = str(out)
+        if created:
+            job["created"] = created
+        mgr._touch(job)
+    return job
+
+def items_of(job):
+    return {it["id"]: it for it in job["items"]}
+
+def full_scan():
+    return {(j["id"], it["id"]) for j in mgr.jobs.values() for it in j["items"] if it["status"] in M.LIVE}
+
+# ---------- scheduler index and priorities
+j1 = make_job("one", ["a1", "a2", "a3"], created=1000)
+j2 = make_job("two", ["b1", "b2"], created=2000)
+mgr.queue(j1["id"], None, dict(OPTS))
+mgr.queue(j2["id"], None, dict(OPTS))
+check("index: queued items indexed", set(mgr._live) == full_scan() and len(mgr._live) == 5, len(mgr._live))
+with mgr.cond:
+    order = [it["id"] for _, it in mgr._queue_order()]
+check("order: oldest playlist first, then playlist order", order == ["a1", "a2", "a3", "b1", "b2"], order)
+with mgr.cond:
+    mgr._set(j2, items_of(j2)["b2"], priority=5)
+    order = [it["id"] for _, it in mgr._queue_order()]
+check("order: higher priority goes first", order[0] == "b2", order)
+with mgr.cond:
+    mgr._set(j2, items_of(j2)["b2"], held=True)
+level["v"] = "good"
+with mgr.cond:
+    pick = mgr._next_item()
+level["v"] = "offline"
+check("held: a paused video is skipped by the scheduler", pick and pick[1]["id"] == "a1", pick and pick[1]["id"])
+mgr.item_action(j1["id"], "a3", "cancel")
+check("index: cancelled video leaves the index", ("%s" % j1["id"], "a3") not in mgr._live and set(mgr._live) == full_scan())
+mgr.action(j2["id"], "stop")
+check("index: stopping a playlist empties its part", not any(k[0] == j2["id"] for k in mgr._live) and set(mgr._live) == full_scan())
+mgr.action(j2["id"], "remove")
+mgr.action(j1["id"], "stop")
+check("index: empty after stop/remove", not mgr._live and not full_scan())
+
+# ---------- a real download: event log, format note, sub-step cleared
+j3 = make_job("three", ["ok1", "bad1"])
+FAIL_IDS.add("bad1")
+mgr.queue(j3["id"], None, dict(OPTS))
+level["v"] = "good"
+it3 = items_of(j3)
+check("download: finishes", wait(lambda: it3["ok1"]["status"] == "done" and it3["bad1"]["status"] == "failed", 90),
+      (it3["ok1"]["status"], it3["ok1"]["error"], it3["bad1"]["status"]))
+level["v"] = "offline"
+check("format note: chosen format recorded", "640x360" in (it3["ok1"].get("fmt") or "") and "avc1" in it3["ok1"]["fmt"],
+      it3["ok1"].get("fmt"))
+check("step: cleared once finished", it3["ok1"].get("step") is None)
+check("history: failed attempt recorded with its kind", it3["bad1"]["history"] and it3["bad1"]["history"][-1]["kind"] == "permanent",
+      it3["bad1"].get("history"))
+rows = mgr.history()["rows"]
+done = [r for r in rows if r["id"] == "ok1"]
+failed = [r for r in rows if r["id"] == "bad1"]
+check("events: done download logged with size and time", done and done[0]["bytes"] > 0 and done[0]["seconds"] > 0
+      and done[0]["status"] == "done", done)
+check("events: failure logged with kind", failed and failed[0]["kind"] == "permanent" and failed[0]["current"] == "failed", failed)
+act = mgr.activity()
+check("activity: recently finished comes from the event log", {r["id"] for r in act["recent"]} >= {"ok1", "bad1"})
+check("activity: 24-hour counts", act["stats"]["done_today"] >= 1 and act["stats"]["failed_today"] >= 1, act["stats"])
+# retrying keeps the history row
+mgr.item_action(j3["id"], "bad1", "retry")
+check("events: a retried video stays in Recently finished", any(r["id"] == "bad1" for r in mgr.history()["rows"]))
+check("events: current status follows the video", next(r for r in mgr.history()["rows"] if r["id"] == "bad1")["current"] == "queued")
+mgr.item_action(j3["id"], "bad1", "cancel")
+stats = mgr.stats(7)
+check("stats: totals, success rate, kinds", stats["done"] >= 1 and stats["failed"] >= 1 and stats["success"] is not None
+      and stats["kinds"][0]["kind"] == "permanent" and stats["days"], stats)
+n_before = mgr.store.count_events()
+mgr.clear_history()
+check("clear: Recently finished emptied", not mgr.history()["rows"] and mgr.store.count_events() == 0)
+check("clear: stats keep the rows", mgr.stats(7)["done"] == stats["done"])
+
+# ---------- activity filters
+j4 = make_job("four", ["c1", "c2"])
+mgr.queue(j4["id"], None, dict(OPTS))
+check("activity: filter by playlist", {r["id"] for r in mgr.activity(job_id=j4["id"])["queue"]} == {"c1", "c2"})
+check("activity: title search", [r["id"] for r in mgr.activity(q="video c2")["queue"]] == ["c2"])
+check("activity: totals ignore the filter", mgr.activity(q="no such title")["stats"]["queued"] == 2)
+mgr.action(j4["id"], "stop")
+
+# ---------- event log thread safety: many writers at once with the saver
+errors = []
+def writer(n):
+    try:
+        for i in range(20):
+            mgr.store.add_events([{"time": time.time(), "job_id": "x", "item_id": f"{n}-{i}", "status": "done"}])
+            mgr._set(j3, it3["ok1"], title=f"T{n}{i}")
+            mgr.save_state()
+    except Exception as exc:
+        errors.append(exc)
+threads = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+[t.start() for t in threads]; [t.join() for t in threads]
+check("store: concurrent writers never fail", not errors, errors[:2])
+check("store: all rows written", mgr.store.count_events(hidden=True) >= 120)
+
+# ---------- reorder the queue
+j5 = make_job("five", ["d1", "d2", "d3", "d4"])
+mgr.queue(j5["id"], None, dict(OPTS))
+def qorder():
+    return [r["id"] for r in mgr.activity(job_id=j5["id"])["queue"]]
+mgr.move(j5["id"], "d3", "top")
+check("move: to top", qorder()[0] == "d3", qorder())
+mgr.move(j5["id"], "d1", "bottom")
+check("move: to bottom", qorder()[-1] == "d1", qorder())
+mgr.move(j5["id"], "d4", before=(j5["id"], "d2"))
+check("move: drag before another video", qorder() == ["d3", "d4", "d2", "d1"], qorder())
+mgr.move(j5["id"], "d3")
+check("move: drag to the end", qorder() == ["d4", "d2", "d1", "d3"], qorder())
+try:
+    mgr.move(j3["id"], "ok1", "top"); moved = True
+except ValueError:
+    moved = False
+check("move: a downloaded video can't be moved", not moved)
+
+# ---------- try now, clear hold, pause all
+it5 = items_of(j5)
+with mgr.cond:
+    mgr._set(j5, it5["d2"], next_try=time.time() + 300)
+mgr.item_action(j5["id"], "d2", "now")
+check("try now: retry wait cleared", it5["d2"]["next_try"] == 0)
+mgr._hold_queue("YouTube is limiting requests", 300)
+check("hold: queue-wide pause set", mgr.waiting_reason())
+mgr.clear_hold()
+check("try now: queue-wide pause cleared", mgr.hold is None and "limiting" not in (mgr.waiting_reason() or ""))
+mgr.pause_all(True)
+check("pause all: every playlist paused", all(j["paused"] for j in mgr.jobs.values()))
+check("pause all: dashboard says why", all(r["wait"] == "Playlist paused" for r in mgr.activity(job_id=j5["id"])["queue"]))
+mgr.pause_all(False)
+check("resume all", not any(j["paused"] for j in mgr.jobs.values()))
+mgr.action(j5["id"], "stop")
+
+# ---------- retry all failed (drops the archive line of a missing file)
+j6 = make_job("six", ["e1", "e2"])
+it6 = items_of(j6)
+with mgr.cond:
+    it6["e1"].update(status="failed", file_problem="missing", error="gone")
+    it6["e2"].update(status="failed", removed=True)
+    mgr._touch(j6)
+mgr._archive_add(str(out), M.Manager._archive_key(it6["e1"]))
+n = mgr.retry_failed()
+check("retry all failed: requeued (not the unavailable one)", it6["e1"]["status"] == "queued" and it6["e2"]["status"] == "failed", n)
+check("retry all failed: missing file dropped from the archive",
+      M.Manager._archive_key(it6["e1"]) not in M.Manager._archive_ids(str(out)))
+mgr.action(j6["id"], "stop")
+
+# ---------- download schedule
+def at(hour, minute=0):
+    t = list(time.localtime()); t[3], t[4], t[5] = hour, minute, 0
+    return time.mktime(time.struct_time(t))
+mgr.update_settings({"schedule_on": True, "schedule_start": "1:00", "schedule_end": "07:00"})
+check("schedule: times normalised", mgr.settings["schedule_start"] == "01:00")
+mgr.clock = lambda: at(3)
+check("schedule: inside the window", mgr._in_schedule())
+mgr.clock = lambda: at(12)
+check("schedule: outside the window", not mgr._in_schedule() and "schedule" in (mgr.waiting_reason() or ""), mgr.waiting_reason())
+mgr.queue(j6["id"], ["e1"], dict(OPTS))
+level["v"] = "good"
+with mgr.cond:
+    pick = mgr._next_item()
+level["v"] = "offline"
+check("schedule: nothing starts outside the window", pick is None)
+mgr.update_settings({"schedule_start": "23:00", "schedule_end": "06:00"})
+mgr.clock = lambda: at(2)
+check("schedule: window across midnight", mgr._in_schedule())
+mgr.update_settings({"schedule_on": False, "schedule_start": "bad"})
+check("schedule: bad time falls back", mgr.settings["schedule_start"] == "01:00")
+mgr.clock = time.time
+mgr.action(j6["id"], "stop")
+
+# ---------- total speed limit
+MB = 1024 * 1024
+mgr.update_settings({"rate_limit_mb": 0, "total_rate_mb": 4})
+check("speed: total shared between downloads", abs(mgr._rate_for(3) - 4 * MB / 3) < 1)
+mgr.update_settings({"rate_limit_mb": 1})
+check("speed: per-download limit when lower", mgr._rate_for(2) == 1 * MB)
+class FakeYdl: pass
+fakes = [FakeYdl(), FakeYdl()]
+for f_ in fakes: f_.params = {}
+with mgr.cond:
+    mgr._ydls.update(fakes)
+mgr.update_settings({"rate_limit_mb": 0, "total_rate_mb": 2})
+check("speed: running downloads rebalanced", all(f_.params["ratelimit"] == 1 * MB for f_ in fakes), [f_.params for f_ in fakes])
+with mgr.cond:
+    mgr._ydls.difference_update(fakes)
+mgr.update_settings({"total_rate_mb": 0})
+
+# ---------- pause one running video: it stops, keeps its partial download and continues later
+j7 = make_job("seven", ["slow1"])
+it7 = items_of(j7)["slow1"]
+throttle["on"] = True
+mgr.queue(j7["id"], None, dict(OPTS))
+level["v"] = "good"
+check("hold: download running", wait(lambda: it7["status"] == "downloading" and (it7.get("downloaded") or 0) > 0, 60),
+      (it7["status"], it7.get("error")))
+mgr.item_action(j7["id"], "slow1", "hold")
+check("hold: running video goes back to the queue, paused", wait(lambda: it7["status"] == "queued" and it7["held"], 30),
+      it7["status"])
+time.sleep(2.5)
+check("hold: not restarted while paused", it7["status"] == "queued")
+check("hold: partial download kept", any(p.name.endswith(".part") for p in out.iterdir() if "[slow1]" in p.name),
+      [p.name for p in out.iterdir()])
+throttle["on"] = False
+mgr.item_action(j7["id"], "slow1", "unhold")
+check("unhold: finishes", wait(lambda: it7["status"] == "done", 90), (it7["status"], it7.get("error")))
+level["v"] = "offline"
+
+# ---------- open, delete and mark files
+opened = []
+M._open_path = lambda path, reveal=False: opened.append((path, reveal))
+mgr.item_action(j7["id"], "slow1", "reveal")
+mgr.item_action(j7["id"], "slow1", "play")
+check("reveal/play: the video's own file", opened == [(it7["filepath"], True), (it7["filepath"], False)], opened)
+try:
+    mgr.item_action(j6["id"], "e2", "play"); refused = False
+except ValueError:
+    refused = True
+check("play: refused without a file", refused)
+keep = out / "Unrelated [slow1x].mp4"; keep.write_bytes(b"x")
+(out / f"Video slow1 [slow1].en.srt").write_text("1")
+mgr.item_action(j7["id"], "slow1", "delete-file")
+check("delete file: video's files gone, status not downloaded",
+      it7["status"] == "new" and not any("[slow1]" in p.name for p in out.iterdir()), [p.name for p in out.iterdir()])
+check("delete file: other files kept", keep.exists())
+check("delete file: archive line removed", M.Manager._archive_key(it7) not in M.Manager._archive_ids(str(out)))
+mgr.item_action(j7["id"], "slow1", "mark-done")
+check("mark as downloaded: skipped and archived", it7["status"] == "skipped"
+      and M.Manager._archive_key(it7) in M.Manager._archive_ids(str(out)))
+
+# ---------- export .m3u
+m3u = mgr.export_m3u(j3["id"])
+text = Path(m3u["path"]).read_text()
+check("m3u: written in the playlist folder", m3u["count"] == 1 and Path(m3u["path"]).parent == out, m3u)
+check("m3u: relative path and duration", "#EXTINF:30," in text and os.path.basename(it3["ok1"]["filepath"]) in text, text)
+
+# ---------- no false "damaged": a file ffprobe can't open but that decodes fully is kept
+check("full decode: good file plays", M._decodes_fully(str(media / "full.mp4"), 30))
+junk = TMP / "junk.mp4"; junk.write_bytes(os.urandom(50000))
+check("full decode: garbage fails", not M._decodes_fully(str(junk), 30))
+cut = TMP / "cut.mp4"; cut.write_bytes(GOOD[: len(GOOD) // 2])
+check("full decode: cut-off file fails", not M._decodes_fully(str(cut), 30))
+real_verify = M._verify_file
+M._verify_file = lambda path, duration: M.DAMAGED
+mgr.start_check(j3["id"])
+wait(lambda: not j3["check"]["running"])
+M._verify_file = real_verify
+check("check: file that plays is not renamed", it3["ok1"]["status"] == "done" and os.path.exists(it3["ok1"]["filepath"])
+      and j3["check"]["damaged"] == 0, (it3["ok1"]["status"], j3["check"]))
+check("check: second opinion logged", any("plays to the end" in l for l in it3["ok1"]["log"]))
+
+# ---------- remove a playlist with its files (only its own, tagged files)
+rm = TMP / "rm"; rm.mkdir()
+j8 = make_job("eight", ["r1", "r2"])
+j9 = make_job("nine", ["r2"])                 # another playlist in the same folder shares r2
+with mgr.cond:
+    for j in (j8, j9):
+        j["outdir"] = str(rm)
+        for it in j["items"]:
+            it.update(outdir=str(rm), status="done")
+for name in ("01 - Video r1 [r1].mp4", "Video r1 [r1].jpg", "02 - Video r2 [r2].mp4", "notes [other].txt"):
+    (rm / name).write_bytes(b"x")
+mgr._archive_add(str(rm), "test r1"); mgr._archive_add(str(rm), "test r2")
+mgr.remove(j8["id"], delete_files=True)
+check("remove: playlist gone at once", j8["id"] not in mgr.jobs)
+check("remove + delete: own files deleted", wait(lambda: not (rm / "01 - Video r1 [r1].mp4").exists(), 10)
+      and not (rm / "Video r1 [r1].jpg").exists(), [p.name for p in rm.iterdir()])
+check("remove + delete: file another playlist still has is kept", (rm / "02 - Video r2 [r2].mp4").exists())
+check("remove + delete: unrelated file kept", (rm / "notes [other].txt").exists())
+check("remove + delete: archive lines of deleted files dropped", M.Manager._archive_ids(str(rm)) == {"test r2"},
+      M.Manager._archive_ids(str(rm)))
+
+# ---------- subtitle languages and SponsorBlock options
+o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "en, fa", "auto_subs": True})
+check("subs: chosen languages with regional variants", o["subtitleslangs"] == ["en", "en-.*", "fa", "fa-.*"], o["subtitleslangs"])
+check("subs: auto-generated subtitles", o.get("writeautomaticsub") is True)
+o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "../etc; $(x)"})
+check("subs: bad language codes fall back to English", o["subtitleslangs"] == ["en", "en-.*"], o["subtitleslangs"])
+o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "remove"})
+keys = [p_["key"] for p_ in pps]
+mc = next(p_ for p_ in pps if p_["key"] == "ModifyChapters")
+check("sponsorblock: segments cut before metadata is written", keys.index("ModifyChapters") < keys.index("FFmpegMetadata")
+      and mc["remove_sponsor_segments"] == set(M.SPONSOR_CATEGORIES), (keys, mc))
+o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "mark", "metadata": False})
+check("sponsorblock: mark adds chapters even without metadata",
+      any(p_["key"] == "FFmpegMetadata" and p_["add_chapters"] and not p_["add_metadata"] for p_ in pps)
+      and next(p_ for p_ in pps if p_["key"] == "ModifyChapters")["remove_sponsor_segments"] == set())
+
+# ---------- parts of a video
+check("section: times parsed", M._parse_section({"start": "1:00", "end": "2:30.5"}) == {"start": 60.0, "end": 150.5})
+check("section: empty end = to the end", M._parse_section({"start": "90"}) == {"start": 90.0, "end": None})
+check("section: nothing asked", M._parse_section({"start": "", "end": ""}) is None)
+for bad in ({"start": "abc"}, {"start": "2:00", "end": "1:00"}):
+    try:
+        M._parse_section(bad); raised = False
+    except ValueError:
+        raised = True
+    check(f"section: rejects {bad}", raised)
+check("section: file-name label", M._section_label({"start": 60, "end": 150}) == "1-00–2-30")
+check("section: expected length", M._expected_duration({"duration": 300, "options": {"section": {"start": 60, "end": None}}}) == 240)
+
+# real downloads with SponsorBlock (patched: no internet) and with a part
+M.SponsorBlockPP.EXTRACTORS = {**M.SponsorBlockPP.EXTRACTORS, "Test": "YouTube"}
+segments = {"mode": "fail"}
+def fake_segments(self, video_id, service):
+    if segments["mode"] == "fail":
+        raise OSError("network is unreachable")
+    return [{"segment": [5.0, 10.0], "category": "sponsor", "UUID": "u1", "videoDuration": 30, "actionType": "skip",
+             "description": ""}]
+M.SponsorBlockPP._get_sponsor_segments = fake_segments
+j10 = make_job("ten", ["sb1", "sb2", "part1"])
+it10 = items_of(j10)
+mgr.queue(j10["id"], ["sb1"], dict(OPTS, sponsorblock="remove"))
+level["v"] = "good"
+check("sponsorblock: unavailable API doesn't fail the download", wait(lambda: it10["sb1"]["status"] == "done", 90),
+      (it10["sb1"]["status"], it10["sb1"]["error"]))
+check("sponsorblock: failure noted in the log", any("SponsorBlock segments unavailable" in l for l in it10["sb1"]["log"]),
+      it10["sb1"]["log"][-4:])
+segments["mode"] = "ok"
+mgr.queue(j10["id"], ["sb2"], dict(OPTS, sponsorblock="remove"))
+check("sponsorblock: video with a segment cut is verified, not called incomplete",
+      wait(lambda: it10["sb2"]["status"] in ("done", "failed"), 120) and it10["sb2"]["status"] == "done",
+      (it10["sb2"]["status"], it10["sb2"]["error"], it10["sb2"]["log"][-3:]))
+real = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                             it10["sb2"]["filepath"]], capture_output=True, text=True).stdout or 0)
+check("sponsorblock: 5 s segment removed", 23 < real < 27 and abs(it10["sb2"]["media_duration"] - real) < 2,
+      (real, it10["sb2"].get("media_duration")))
+mgr.queue(j10["id"], ["part1"], dict(OPTS, section={"start": "0:05", "end": "0:15"}))
+check("section: part downloaded and verified", wait(lambda: it10["part1"]["status"] in ("done", "failed"), 120)
+      and it10["part1"]["status"] == "done", (it10["part1"]["status"], it10["part1"]["error"]))
+check("section: own file name", "(0-05–0-15) [part1]" in os.path.basename(it10["part1"]["filepath"] or ""),
+      it10["part1"]["filepath"])
+check("section: not written to the archive", M.Manager._archive_key(it10["part1"]) not in M.Manager._archive_ids(str(out)))
+check("section: playlist keeps no part in its saved options", "section" not in j10["options"])
+level["v"] = "offline"
+mgr.start_check(j10["id"])
+wait(lambda: not j10["check"]["running"])
+check("check files: part and cut video count as healthy", j10["check"]["damaged"] == 0
+      and it10["part1"]["status"] == "done" and it10["sb2"]["status"] == "done", j10["check"])
+
+# ---------- size estimate
+est = mgr.estimate(j6["id"], None, {"quality": "1080"})
+check("estimate: duration × bitrate", est["bytes"] == int(30 * 5e6 / 8) and est["count"] == 1 and est["free"] > 0, est)
+est = mgr.estimate(j6["id"], ["e1"], {"quality": "mp3", "section": {"start": "0", "end": "0:10"}})
+check("estimate: audio, part of a video", est["bytes"] == int(10 * 160e3 / 8), est)
+made = []
+real_mkdir = Path.mkdir
+Path.mkdir = lambda self, *a, **k: made.append(self)
+d = M._disk_free(str(TMP / "not" / "there" / "yet"))
+Path.mkdir = real_mkdir
+check("disk free: nearest existing folder, nothing created", d["free"] > 0 and not made and not (TMP / "not").exists(), d)
+if sys.platform == "darwin":
+    check("disk free: unplugged drive reported", M._disk_free("/Volumes/NoSuchDrive123/x")["problem"])
+
+# ---------- subscriptions: due playlists are refreshed and new videos queued
+fetches = {"n": 0}
+def fake_inspect(url, settings):
+    fetches["n"] += 1
+    ids = ["s1", "s2"] + (["s3"] if fetches["n"] > 1 else []) + (["s4"] if fetches["n"] > 2 else [])
+    return {"kind": "playlist", "source_id": "subs", "title": "List subs", "thumbnail": None, "heights": [360],
+            "items": [{"index": i + 1, "id": v, "title": f"Video {v}", "url": f"test://{v}", "duration": 30,
+                       "extractor": "Test"} for i, v in enumerate(ids)]}
+real_inspect = M.inspect_url
+M.inspect_url = fake_inspect
+js = mgr.open_url("test://list-subs")
+jsub = mgr.jobs[js["id"]]
+with mgr.cond:
+    jsub["outdir"] = str(out)
+    jsub["options"] = dict(OPTS)
+try:
+    mgr.set_sync(jsub["id"], 5, True); bad_choice = False
+except ValueError:
+    bad_choice = True
+check("sync: only offered intervals accepted", bad_choice)
+mgr.set_sync(jsub["id"], 6, True)
+check("sync: not due right after it's set", mgr.sync_due() == [])
+with mgr.cond:
+    jsub["sync"]["last"] = time.time() - 7 * 3600
+mgr.net_level = lambda: "offline"
+check("sync: waits while offline", mgr.sync_due() == [])
+mgr.net_level = lambda: level["v"]
+level["v"] = "good"
+mgr.pause_all(True)                     # keep it from downloading; queueing must not resume the playlist
+check("sync: due playlist refreshed", mgr.sync_due() == [jsub["id"]])
+sub_items = items_of(jsub)
+check("sync: new video queued automatically", sub_items["s3"]["status"] == "queued"
+      and sub_items["s1"]["status"] == "new", {k: v["status"] for k, v in sub_items.items()})
+check("sync: paused playlist stays paused", jsub["paused"])
+check("sync: last check recorded", time.time() - jsub["sync"]["last"] < 5)
+mgr.pause_all(False)
+mgr.action(jsub["id"], "stop")
+level["v"] = "offline"
+
+# ---------- a playlist's Save button: options kept without queueing anything, and used by auto-download
+saved_dir = out / "saved"
+r = mgr.set_options(jsub["id"], dict(OPTS, quality="720", sponsorblock="mark", output_dir=str(saved_dir),
+                                     section={"start": "0:05", "end": ""}))
+check("save options: stored without queueing", jsub["options"]["quality"] == "720"
+      and jsub["options"]["sponsorblock"] == "mark" and jsub["outdir"] == str(saved_dir) and saved_dir.is_dir()
+      and not any(i["status"] == "queued" for i in jsub["items"]), (jsub["options"], jsub["outdir"]))
+check("save options: a part of a video and the folder aren't stored as options",
+      "section" not in jsub["options"] and "output_dir" not in jsub["options"], jsub["options"])
+if sys.platform == "darwin":
+    try:
+        mgr.set_options(jsub["id"], dict(OPTS, output_dir="/Volumes/No Such Drive ytdl/x"))
+        refused = False
+    except OSError:
+        refused = True
+    check("save options: a folder on an unplugged drive is refused, nothing changes",
+          refused and jsub["outdir"] == str(saved_dir) and jsub["options"]["quality"] == "720")
+with mgr.cond:
+    jsub["sync"]["last"] = time.time() - 7 * 3600
+level["v"] = "good"
+mgr.pause_all(True)
+mgr.sync_due()
+s4 = items_of(jsub).get("s4") or {}
+check("save options: auto-download of a new video uses the saved options",
+      s4.get("status") == "queued" and (s4.get("options") or {}).get("quality") == "720"
+      and s4.get("outdir") == str(saved_dir), (s4.get("status"), s4.get("options"), s4.get("outdir")))
+mgr.pause_all(False)
+mgr.action(jsub["id"], "stop")
+level["v"] = "offline"
+
+# ---------- add many links at once
+def fake_inspect_many(url, settings):
+    if "broken" in url:
+        raise DownloadError("ERROR: Unsupported URL: " + url)
+    vid = url.rsplit("/", 1)[-1]
+    return {"kind": "video", "source_id": vid, "title": f"Single {vid}", "thumbnail": None, "heights": [360],
+            "items": [{"index": 1, "id": vid, "title": f"Single {vid}", "url": url, "duration": 30, "extractor": "Test"}]}
+M.inspect_url = fake_inspect_many
+res = mgr.open_many(["https://x.test/m1", "not a link", "https://x.test/m1", "https://x.test/broken", "https://x.test/m2"])
+check("import: links cleaned and de-duplicated", res["total"] == 3, res)
+check("import: finishes", wait(lambda: not mgr.importing["running"], 30))
+check("import: progress and failures reported", mgr.importing["added"] == 2 and len(mgr.importing["failed"]) == 1
+      and "Unsupported" in mgr.importing["failed"][0]["error"], mgr.importing)
+check("import: in the overview", mgr.overview()["import"]["done"] == 3)
+M.inspect_url = real_inspect
+
+# ---------- yt-dlp version and update (no network: command and version lookup replaced)
+info = mgr.ytdlp_info()
+check("ytdlp: version reported", info["version"] == M.yt_dlp.version.__version__)
+mgr._update_cmd = lambda: [sys.executable, "-c", "print('updated')"]
+mgr._installed_ytdlp = lambda: "2099.01.01"
+mgr.update_ytdlp()
+check("ytdlp: update runs and asks for a restart", wait(lambda: not mgr.updating["running"], 30)
+      and mgr.updating["ok"] and mgr.updating["restart"] and "updated" in mgr.updating["output"], mgr.updating)
+
+# ---------- backfill: a library from before the event log gets its downloads added once
+lib = TMP / "lib2"; lib.mkdir()
+f = out / "Old [old1].mp4"; f.write_bytes(GOOD)
+os.utime(f, (1_700_000_000, 1_700_000_000))
+old_job = {k: v for k, v in j3.items() if k != "items"} | {"id": "oldjob", "rev": 3, "items": [
+    dict(it3["ok1"], id="old1", title="Old", status="done", filepath=str(f), finished=None, rev=3)]}
+con = sqlite3.connect(lib / "library.db")
+con.executescript("CREATE TABLE jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL);"
+                  "CREATE TABLE items (job_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (job_id, id));")
+con.execute("INSERT INTO jobs VALUES (?, ?)", ("oldjob", json.dumps({k: v for k, v in old_job.items() if k != "items"})))
+con.execute("INSERT INTO items VALUES (?, ?, ?)", ("oldjob", "old1", json.dumps(old_job["items"][0])))
+con.commit(); con.close()
+M.DATA_DIR, M.DB_FILE, M.DB_BACKUP = lib, lib / "library.db", lib / "library.backup.db"
+M.LEGACY_STATE, M.LEGACY_BACKUP, M.SETTINGS_FILE = lib / "state.json", lib / "state.backup.json", lib / "settings.json"
+m2 = M.Manager()
+m2.net_level = lambda: "offline"
+rows = m2.history()["rows"]
+check("backfill: earlier download added, dated by its file", len(rows) == 1 and rows[0]["id"] == "old1"
+      and int(rows[0]["finished"]) == 1_700_000_000 and rows[0]["bytes"] == len(GOOD), rows)
+check("backfill: done once (version recorded)", m2.store.version == 1)
+
+# ---------- export all data, import it into another library (merge, never delete)
+data = json.loads(json.dumps(mgr.export_data()))          # must survive JSON
+n_items = sum(len(j["items"]) for j in mgr.jobs.values())
+check("export: every playlist, video and event", len(data["jobs"]) == len(mgr.jobs)
+      and sum(len(j["items"]) for j in data["jobs"]) == n_items
+      and len(data["events"]) == mgr.store.count_events(hidden=True) > 0, (len(data["jobs"]), len(data["events"])))
+check("export: settings, marker, no runtime fields", data["app"] == M.EXPORT_APP and data["format"] == M.EXPORT_FORMAT
+      and data["settings"]["output_dir"] == str(out)
+      and not any(k in it for j in data["jobs"] for it in j["items"] for k in M.TRANSIENT))
+check("export: summary per playlist", all(j["summary"]["videos"] == len(j["items"]) for j in data["jobs"])
+      and sum(j["summary"]["downloaded"] for j in data["jobs"])
+      == sum(it["status"] in ("done", "skipped") for j in data["jobs"] for it in j["items"]
+             if not (it.get("removed") and it["status"] in ("new", "failed"))))
+m2_out = m2.settings["output_dir"]
+done_before = sum(it["status"] == "done" for it in m2.jobs["oldjob"]["items"])   # oldjob is a copy of j3's playlist
+r = m2.import_data(data, check_files=False)
+check("import data: playlists, videos and history added", r["playlists_added"] == len(mgr.jobs) - 1
+      and r["playlists_merged"] == 1 and r["videos_added"] == n_items and r["events_added"] == len(data["events"])
+      and r["skipped"] == 0, r)
+check("import data: the same playlist is merged, not duplicated", "oldjob" in m2.jobs and j3["id"] not in m2.jobs
+      and set(items_of(j3)) <= set(items_of(m2.jobs["oldjob"])))
+check("import data: settings kept unless asked", not r["settings"] and m2.settings["output_dir"] == m2_out)
+def expected(st):
+    return "queued" if st in M.ACTIVE else st
+got = {it["id"]: it["status"] for j in m2.jobs.values() for it in j["items"]}
+check("import data: every video keeps its state (interrupted ones queued again)",
+      all(got[it["id"]] == expected(it["status"]) or (it["status"] == "new" and got[it["id"]] == "skipped")
+          for j in data["jobs"] for it in j["items"]), [(it["id"], it["status"], got[it["id"]]) for j in data["jobs"]
+                                                       for it in j["items"] if got[it["id"]] != expected(it["status"])])
+check("import data: queued videos are in the scheduler", {k[1] for k in m2._live}
+      == {i for i, st in got.items() if st in M.LIVE})
+check("import data: done videos stay done", sum(it["status"] == "done" for j in m2.jobs.values() for it in j["items"])
+      == sum(it["status"] == "done" for j in mgr.jobs.values() for it in j["items"]) + done_before > 0)
+check("import data: saved to the database", len(m2.store.load()) == len(m2.jobs) == len(mgr.jobs)
+      and sum(len(j["items"]) for j in m2.store.load()) == n_items + 1)
+r = m2.import_data(data, check_files=False)
+check("import data: twice adds nothing", r["playlists_added"] == 0 and r["playlists_merged"] == len(mgr.jobs)
+      and r["videos_added"] == 0 and r["events_added"] == 0, r)
+src = next(j for j in data["jobs"] if j["kind"] == "playlist" and j["items"] and j["id"] != j3["id"])
+local = m2.jobs[src["id"]]
+local_numbers = {it["number"] for it in local["items"]}
+extra = dict(src["items"][0], id="extra1", title="Extra", status="queued")   # same file number as a known video
+r = m2.import_data(data | {"jobs": [src | {"items": src["items"] + [extra]}], "events": []}, check_files=False)
+new = items_of(local).get("extra1")
+check("import data: merge adds only the missing video", r["videos_added"] == 1 and r["playlists_merged"] == 1 and new, r)
+check("import data: merged video gets a free number, goes last, keeps its state",
+      new and new["number"] not in local_numbers and new["index"] == max(it["index"] for it in local["items"])
+      and new["status"] == "queued", new and (new["number"], local_numbers, new["status"]))
+r = m2.import_data(data | {"jobs": [], "events": [], "settings": data["settings"] | {"concurrency": 5}}, True, False)
+check("import data: settings when asked", r["settings"] and m2.settings["concurrency"] == 5, r)
+for bad, why in (({"app": "other", "jobs": []}, "a foreign file"), (data | {"format": 99}, "a newer format"),
+                 ([1, 2], "a non-object")):
+    try:
+        m2.import_data(bad)
+        check(f"import data: refuses {why}", False)
+    except ValueError:
+        check(f"import data: refuses {why}", True)
+r = m2.import_data(data | {"jobs": [{"id": "x"}, src | {"id": "new-id", "url": "test://other", "source_id": "other",
+                                                      "items": [{"id": "y"}, *src["items"]]}], "events": []},
+                   check_files=False)
+check("import data: bad entries skipped, the rest kept", r["skipped"] == 2 and r["playlists_added"] == 1
+      and r["videos_added"] == len(src["items"]), r)
+# the folder of an imported playlist is checked: good files found, recorded files confirmed, missing ones flagged
+fold = TMP / "imported"; fold.mkdir()
+(fold / "Here [have1].mp4").write_bytes(GOOD)
+(fold / "Kept [kept1].mp4").write_bytes(GOOD)
+vid = lambda i, **k: {"index": i, "id": k.pop("id"), "title": "T", "extractor": "Test", "duration": 30,
+                      "url": "test://x", **k}
+r = m2.import_data({"app": M.EXPORT_APP, "format": 1, "jobs": [{
+    "id": "folderjob", "url": "test://folder", "source_id": "folder", "title": "Folder", "kind": "playlist",
+    "outdir": str(fold), "items": [vid(1, id="have1", status="new"),
+                                   vid(2, id="kept1", status="done", filepath=str(fold / "Kept [kept1].mp4")),
+                                   vid(3, id="gone1", status="done", filepath=str(fold / "Gone [gone1].mp4")),
+                                   vid(4, id="todo1", status="new")]}]})
+fj = m2.jobs["folderjob"]
+check("import data: folders checked after import", r["checking"] == 1
+      and wait(lambda: (fj.get("check") or {}).get("finished"), 60), fj.get("check"))
+fi = items_of(fj)
+check("import data: check finds files, confirms done ones, flags missing ones",
+      fi["have1"]["status"] == "skipped" and fi["kept1"]["status"] == "done" and fi["kept1"]["health"] == "ok"
+      and fi["gone1"]["status"] == "failed" and fi["gone1"].get("file_problem") and fi["todo1"]["status"] == "new",
+      {k: (v["status"], v.get("file_problem")) for k, v in fi.items()})
+
+# ---------- every setting survives Save and a reload ("Desktop notifications" came back unticked)
+before = dict(m2.settings)
+values = {"output_dir": str(TMP / "elsewhere"), "concurrency": 5, "cookies_browser": "firefox",
+          "cookies_profile": "abc.default-release", "rate_limit_mb": 1.5, "sleep_between": 3.0,
+          "proxy": "http://127.0.0.1:9", "wait_for_network": False, "total_rate_mb": 4.0, "schedule_on": True,
+          "schedule_start": "02:30", "schedule_end": "06:15", "sub_langs": "en, fa", "notify": True}
+check("settings: the round-trip covers every setting", set(values) == set(M.DEFAULT_SETTINGS),
+      set(M.DEFAULT_SETTINGS) ^ set(values))
+check("settings: every test value differs from its default", all(values[k] != M.DEFAULT_SETTINGS[k] for k in values))
+saved = m2.update_settings(values)
+reread = M._coerce_settings(json.loads(M.SETTINGS_FILE.read_text()))
+check("settings: every value saved and read back unchanged", saved == values and reread == values,
+      {k: (saved.get(k), reread.get(k)) for k in values if saved.get(k) != values[k] or reread.get(k) != values[k]})
+check("settings: sent to the page", m2.overview()["settings"]["notify"] is True)
+m2.update_settings(before)
+
+# ---------- import a cookies.txt (Netscape format), remove it again
+NETSCAPE = ("# Netscape HTTP Cookie File\n"
+            ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc\n"
+            "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\txyz\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tother\t1\n")
+for bad, why in (("hello, these are not cookies", "not cookies.txt"),
+                 (".example.com\tTRUE\t/\tFALSE\t0\tother\t1\n", "no YouTube cookies")):
+    try:
+        m2.import_cookies(bad)
+        check(f"cookies file: refuses {why}", False)
+    except ValueError:
+        check(f"cookies file: refuses {why}", not M._cookie_file().exists())
+m2._hold_queue("YouTube is limiting requests", 600, "ratelimit")
+m2.rate_probe = True
+st = m2.import_cookies(NETSCAPE)
+check("cookies file: imported with counts", st.get("youtube") == 2 and st.get("count") == 3 and st.get("signed_in")
+      and m2.overview()["cookie_file"]["youtube"] == 2, st)
+check("cookies file: readable only by the user", (M._cookie_file().stat().st_mode & 0o077) == 0,
+      oct(M._cookie_file().stat().st_mode))
+check("cookies file: importing ends the rate-limit pause at once", m2.hold is None and not m2.rate_probe, m2.hold)
+seen = []
+real_ydl = M.yt_dlp.YoutubeDL
+class SpyYDL(real_ydl):
+    def __init__(self, params=None, *a, **k):
+        seen.append(dict(params or {}))
+        super().__init__(params, *a, **k)
+M.yt_dlp.YoutubeDL = SpyYDL
+try:
+    opts = M._base_opts({"cookies_browser": "chrome"})
+    with M._ytdl(opts) as y1, M._ytdl(opts) as y2:
+        paths = [y1.params.get("cookiefile"), y2.params.get("cookiefile")]
+        copies_ok = all(p and Path(p).read_text() == NETSCAPE for p in paths)
+finally:
+    M.yt_dlp.YoutubeDL = real_ydl
+check("cookies file: each download gets its own copy (yt-dlp writes cookies back)",
+      paths[0] != paths[1] and copies_ok and all(p != str(M._cookie_file()) for p in paths), paths)
+check("cookies file: used instead of the browser's cookies", all("cookiesfrombrowser" not in s for s in seen), seen)
+check("cookies file: copies removed afterwards", not any(Path(p).exists() for p in paths))
+check("cookies file: never in the data export", "SAPISID" not in json.dumps(m2.export_data()))
+check("cookies file: removed", m2.remove_cookies() and not M._cookie_file().exists()
+      and m2.overview()["cookie_file"] is None)
+
+srv.shutdown()
+print("\nALL PASSED" if ok else "\nSOME FAILED")
+sys.exit(0 if ok else 1)

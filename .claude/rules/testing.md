@@ -16,4 +16,6 @@ paths:
   - Use the patched `YoutubeDL.extract_info` + `process_ie_result` in `test_health.py` for merged video+audio downloads.
   - Generate media with `ffmpeg -f lavfi` (testsrc/sine).
 - **Wait with polling helpers** (`wait`, `wait_status`) and generous timeouts, never fixed sleeps for completion.
-- **Run all three suites before claiming something works** (the `run-tests` skill). Some checks depend on timing; run them twice when touching the scheduler or locks.
+- **Page logic** (`static/js/util.js`, `filters.js`, `stats.js` `buckets`) is tested by `tests/test_ui.mjs` with plain Node, in the same PASS/FAIL style. Keep those modules free of DOM access at import time.
+- **New features go in `tests/test_features.py`** (scheduler index and priorities, event log, queue controls, schedule, speed limits, file actions, SponsorBlock, parts, subscriptions…). It reuses `test_health.py`'s fake extractor and adds a throttled local media server for "pause a running download".
+- **Run all suites before claiming something works** (the `run-tests` skill). Some checks depend on timing; run them twice when touching the scheduler or locks.

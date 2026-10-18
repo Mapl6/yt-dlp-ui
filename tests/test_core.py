@@ -177,6 +177,39 @@ try:
     check("api: foreign Host refused even with token",
           get("/api/overview", {"Host": "evil.example", "X-Token": token.group(1)})[0] == 403)
     check("api: localhost name allowed", get("/", {"Host": f"localhost:{port}"})[0] == 200)
+    tok = token.group(1)
+    H = {"X-Token": tok}
+    # live stream: token only in the query string, only on this path
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/stream?token={tok}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        first = r.readline().decode()
+        ctype = r.headers.get("content-type", "")
+    check("stream: sends the overview and the dashboard", first.startswith("data: ") and "text/event-stream" in ctype
+          and {"overview", "activity"} <= set(json.loads(first[6:])), first[:120])
+    check("stream: refused without its token", get("/api/stream")[0] == 403)
+    check("stream: query token not accepted on other paths", get(f"/api/overview?token={tok}")[0] == 403)
+    status, body = get("/api/history", H)
+    check("history: answers", status == 200 and "rows" in json.loads(body), body[:200])
+    status, body = get("/api/stats?days=7", H)
+    check("stats: answers", status == 200 and json.loads(body)["period"] == 7, body[:200])
+    status, body = get("/api/activity?q=nothing", H)
+    check("activity: has queue ETA, disks and speed history", status == 200 and
+          {"eta", "disks", "speed_history", "left_bytes"} <= set(json.loads(body)["stats"]), body[:300])
+    def post(path, data=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="POST",
+                                     data=json.dumps(data or {}).encode(), headers=H | {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+    check("file actions: unknown video refused", post("/api/jobs/nope/items/x/reveal")[0] == 404)
+    check("queue move: unknown video refused", post("/api/queue/move", {"job": "nope", "id": "x", "to": "top"})[0] == 404)
+    check("queue: unknown action refused", post("/api/queue/explode")[0] == 404)
+    check("queue: pause all works", post("/api/queue/pause-all")[0] == 200 and post("/api/queue/resume-all")[0] == 200)
+    check("open-many: no links refused", post("/api/open-many", {"urls": ["nothing here"]})[0] == 400)
+    status, body = get("/api/ytdlp", H)
+    check("ytdlp: version and restart flag", status == 200 and json.loads(body)["can_restart"] is True, body[:200])
     # a second copy on the same port exits before starting any downloads (no library created)
     env2 = os.environ | {"YTDL_DATA_DIR": str(TMP / "srv2")}
     r = subprocess.run([sys.executable, str(ROOT / "server.py"), "--port", str(port), "--no-browser"],
@@ -185,6 +218,41 @@ try:
           r.returncode != 0 and "already in use" in r.stderr and not (TMP / "srv2" / "library.db").exists(), r.stderr[-200:])
 finally:
     srv.terminate(); srv.wait(5)
+
+# ---------- password (meant for network mode; applies whenever one is set)
+s = socket.socket(); s.bind(("127.0.0.1", 0)); pport = s.getsockname()[1]; s.close()
+psrv = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port", str(pport), "--no-browser"],
+                        cwd=ROOT, env=os.environ | {"YTDL_DATA_DIR": str(TMP / "psrv"), "YTDL_PASSWORD": "s3cret"},
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+opener = urllib.request.build_opener(NoRedirect)
+def req_(path, data=None, headers=None):
+    r = urllib.request.Request(f"http://127.0.0.1:{pport}{path}", data=data, headers=headers or {})
+    try:
+        with opener.open(r, timeout=5) as resp:
+            return resp.status, resp.read().decode(), resp.headers
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), e.headers
+try:
+    for _ in range(50):
+        try:
+            status, body, hdrs = req_("/"); break
+        except OSError:
+            time.sleep(0.2)
+    check("password: page redirects to the login", status == 303 and hdrs.get("location") == "/login", status)
+    check("password: no token handed out before login", "api-token" not in body)
+    check("password: API refused without login", req_("/api/overview")[0] == 401)
+    status, body, hdrs = req_("/login", b"password=s3cret")
+    cookie = (hdrs.get("set-cookie") or "").split(";")[0]
+    check("password: right password logs in", status == 303 and cookie.startswith("ytdl_session=")
+          and "httponly" in hdrs.get("set-cookie", "").lower(), (status, hdrs.get("set-cookie")))
+    status, body, _ = req_("/", headers={"Cookie": cookie})
+    check("password: logged-in browser gets the page", status == 200 and 'name="api-token" content="' in body)
+    codes = [req_("/login", b"password=wrong")[0] for _ in range(6)]
+    check("password: wrong ones refused, then rate-limited", codes[:5] == [401] * 5 and codes[5] == 429, codes)
+finally:
+    psrv.terminate(); psrv.wait(5)
 
 print("\nALL PASSED" if ok else "\nSOME FAILED")
 sys.exit(0 if ok else 1)
