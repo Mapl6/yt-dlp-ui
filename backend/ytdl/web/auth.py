@@ -14,32 +14,20 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 
 router = APIRouter()
 
-
-
 # Protection for the local API:
 #  * Host check: a web page can't reach us through DNS rebinding (its requests carry its own host name).
 #  * Session token: every /api call needs the token embedded in our page, which other sites can't read,
 #    and the custom header forces a CORS preflight that other origins fail.
 TOKEN = secrets.token_urlsafe(24)
-
-
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
-
-
 security = {"any_host": False,   # set when the user deliberately serves on the network (--host 0.0.0.0)
-            "password": ""}      # --password / YTDL_PASSWORD: required to open the app (meant for network mode)
-
-
+            "password": "",      # --password / YTDL_PASSWORD: required to open the app (meant for network mode)
+            "dev": False}        # --dev: `next dev` (another port) may ask for the token at /api/dev-token
 SESSION_COOKIE = "ytdl_session"
-
-
 sessions: set[str] = set()        # logged-in browsers (in memory: a restart asks for the password again)
-
-
 login_failures: dict[str, deque] = defaultdict(deque)   # client ip -> times of recent wrong passwords
-
-
 LOGIN_LIMIT = 5                   # wrong passwords per minute per client
+DEV_TOKEN_PATH = "/api/dev-token"
 
 
 async def guard(request: Request, call_next):
@@ -52,7 +40,7 @@ async def guard(request: Request, call_next):
         if path.startswith("/api/"):
             return JSONResponse({"detail": "Password needed — reload the page."}, status_code=401)
         return RedirectResponse("/login", status_code=303)
-    if path.startswith("/api/"):
+    if path.startswith("/api/") and not (security["dev"] and path == DEV_TOKEN_PATH):
         # EventSource can't send headers, so the live stream (only) takes the token from the query string.
         sent = request.query_params.get("token", "") if path == "/api/stream" else request.headers.get("x-token", "")
         if not secrets.compare_digest(sent, TOKEN):
@@ -108,3 +96,12 @@ async def login(request: Request):
     response = RedirectResponse("/", status_code=303)
     response.set_cookie(SESSION_COOKIE, session, max_age=30 * 86400, httponly=True, samesite="strict")
     return response
+
+
+@router.get("/api/dev-token")
+def dev_token():
+    """Only with --dev: the page served by `next dev` can't have the token written into it, so it asks here.
+    Still behind the Host check (and the password, if one is set)."""
+    if not security["dev"]:
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    return {"token": TOKEN}

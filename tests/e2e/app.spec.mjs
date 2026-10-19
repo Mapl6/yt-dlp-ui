@@ -1,4 +1,5 @@
-// The main flows in a real browser, against tests/e2e/fake_app.py (see playwright.config.mjs).
+// The main flows in a real browser, against tests/e2e/fake_app.py (see playwright.config.mjs), on the old page
+// and on the Next.js one.
 // Elements are found by role, label and visible text, so the same tests can check the Next.js port later.
 import { readFileSync } from "node:fs";
 import { expect, test } from "@playwright/test";
@@ -30,12 +31,12 @@ async function jobId(page, title) {
 }
 
 async function throttle(page, on) {
-  const port = test.info().config.metadata.mediaPort;
+  const port = test.info().project.metadata.mediaPort;
   await page.request.get(`http://127.0.0.1:${port}/__throttle/${on ? "on" : "off"}`);
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto("/");
+  await page.goto("./");                     // the page under test: / or /next/
   await expect(page.getByRole("heading", { name: "Download from YouTube" })).toBeVisible();
 });
 

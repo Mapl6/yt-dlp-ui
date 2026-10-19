@@ -1,14 +1,23 @@
 {
-  "name": "yt-downloader-tests",
+  "name": "yt-downloader-dev",
   "private": true,
-  "description": "Test tools only: the app itself needs just Python (see README.md).",
+  "description": "Build and test tools only: the app itself needs just Python (the page is built into frontend/out and committed).",
   "type": "module",
   "scripts": {
+    "build": "next build frontend",
+    "dev": "next dev frontend --port 3000",
     "test:ui": "vitest run",
     "test:e2e": "playwright test"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "next": "16.4.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "5.9.3",
     "vitest": "5.0.2"
   }
 }

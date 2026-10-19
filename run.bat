@@ -3,6 +3,11 @@ rem Launch YT Downloader on Windows: double-click, or run "run.bat [--port 8765]
 rem Sets up the virtualenv on first run, then opens http://127.0.0.1:8765
 setlocal
 cd /d "%~dp0"
+rem Dev mode (the backend plus next dev) is in run.ps1
+if "%~1"=="--dev" (
+  powershell -ExecutionPolicy Bypass -File "%~dp0run.ps1" %*
+  exit /b
+)
 where ffmpeg >nul 2>nul
 if errorlevel 1 (
   echo ffmpeg is required: winget install Gyan.FFmpeg  ^(then open a new terminal^)

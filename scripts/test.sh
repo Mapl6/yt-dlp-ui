@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run every test: syntax checks, pytest (with coverage), Vitest (page logic), Playwright (the page in a browser).
+# Run every test: syntax checks, pytest (with coverage), Vitest (page logic), the page build (Next.js, committed),
+# Playwright (both pages in a browser).
 #   scripts/test.sh          everything
 #   scripts/test.sh --fast   skip real downloads, real server processes and the browser tests
 # Offline once the dependencies are installed; needs ffmpeg. Never touches data/ or your download folders.
@@ -50,6 +51,14 @@ browser() {   # Playwright's own Chromium, or the installed Google Chrome when i
   echo "No browser for Playwright: run 'npx playwright install chromium'"; return 1
 }
 
+build() {   # the page is built into frontend/out and committed: users need only Python
+  npm run --silent build >/dev/null || { npm run build; return 1; }
+  if [ -n "$(git status --porcelain -- frontend/out)" ]; then
+    if [ -n "${CI:-}" ]; then echo "frontend/out is out of date: run npm run build and commit it."; return 1; fi
+    echo "Note: the build in frontend/out changed — commit it with your front-end changes."
+  fi
+}
+
 step "syntax" syntax
 if [ $fast = 1 ]; then
   step "pytest (fast)" "$py" -m pytest -q -n auto --dist loadfile -m "not slow and not server"
@@ -58,6 +67,7 @@ else
 fi
 step "vitest" npx vitest run
 if [ $fast = 0 ]; then
+  step "build" build
   if browser; then
     lsof -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1 && echo "(Your own app is running on 8765; the tests use their own port and library.)"
     step "playwright" npx playwright test

@@ -22,10 +22,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--dev", action="store_true",
+                        help="development: let `npm run dev` (next dev, port 3000) fetch the session token")
     parser.add_argument("--password", default=os.environ.get("YTDL_PASSWORD", ""),
                         help="require this password to open the app (recommended with --host 0.0.0.0)")
     args = parser.parse_args()
     auth.security["password"] = args.password
+    auth.security["dev"] = args.dev
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         auth.security["any_host"] = True
         if not args.password:

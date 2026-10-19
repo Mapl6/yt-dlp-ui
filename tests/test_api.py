@@ -443,3 +443,24 @@ def test_job_actions(api, mgr, out, monkeypatch):
     r = api.post(f"/api/jobs/{jid}/explode")
     assert r.status_code == 400 and "Unknown action" in r.json()["detail"]
     assert api.post(f"/api/jobs/{jid}/remove", json={"delete_files": False}).status_code == 200
+
+
+# ---------- development mode and the Next.js page
+
+def test_dev_token_only_in_dev_mode(api, anon, monkeypatch):
+    assert anon.get("/api/dev-token").status_code == 403, "without --dev it needs the token like any other route"
+    assert api.get("/api/dev-token").status_code == 404, "and doesn't exist"
+    monkeypatch.setitem(auth.security, "dev", True)
+    r = anon.get("/api/dev-token")
+    assert r.status_code == 200 and r.json() == {"token": auth.TOKEN}
+    assert anon.get("/api/overview").status_code == 403, "every other route still needs the token"
+    assert anon.get("/api/dev-token", headers={"Host": "evil.example"}).status_code == 403, "and the Host check applies"
+
+
+def test_next_page_gets_the_token(api):
+    r = api.get("/next/")
+    assert r.status_code == 200 and f'<meta name="api-token" content="{auth.TOKEN}"/>' in r.text
+    assert r.headers["cache-control"] == "no-store"
+    assert api.get("/next", follow_redirects=False).headers["location"] == "/next/"
+    asset = re.search(r'src="(/next/_next/static/[^"]+\.js)"', r.text)
+    assert asset and api.get(asset.group(1)).status_code == 200, "the built scripts are served"
