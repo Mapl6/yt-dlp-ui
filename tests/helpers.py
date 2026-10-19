@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-import manager as M
+from ytdl import manager as M
 
 ROOT = Path(__file__).resolve().parent.parent
 PATH_GLOBALS = ("DATA_DIR", "DB_FILE", "DB_BACKUP", "LEGACY_STATE", "LEGACY_BACKUP", "SETTINGS_FILE")

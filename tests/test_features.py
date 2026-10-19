@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 from yt_dlp.utils import DownloadError
 
-import manager as M
+from ytdl import manager as M
 from helpers import items_of, make_job, new_manager, restore_paths, stop_manager, use_data_dir, wait
 
 MB = 1024 * 1024

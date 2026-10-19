@@ -14,9 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRATCH = Path(tempfile.mkdtemp(prefix="ytdl-pytest-"))
 os.environ["YTDL_DATA_DIR"] = str(SCRATCH / "data")
 (SCRATCH / "data").mkdir()          # app.log lives here for the whole run (one log handler per process)
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "backend"))
 
-import manager as M  # noqa: E402
+from ytdl import manager as M  # noqa: E402
 
 from helpers import (FakeExtractor, Flaky, MediaServer, Net, ff, new_manager, restore_paths,  # noqa: E402
                      stop_manager, use_data_dir)

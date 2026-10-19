@@ -18,7 +18,7 @@ from yt_dlp.networking import Response
 from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.utils import DownloadError, ExtractorError, GeoRestrictedError
 
-import manager as M
+from ytdl import manager as M
 from helpers import ROOT, entry
 
 
@@ -184,6 +184,16 @@ def test_migrate_legacy_state(merged, tmp, make_manager):
     assert any(j["id"] == "oldjob" for j in M.Store(M.DB_FILE, M.DB_BACKUP).load()), "migrate: written to library.db"
     assert (legacy / "state.json.migrated").exists() and not (legacy / "state.json").exists(), \
         "migrate: state.json kept as .migrated"
+
+
+def test_library_stays_in_repo_data():
+    """Without YTDL_DATA_DIR the library is <repo>/data, wherever the code lives (importing creates nothing)."""
+    env = {k: v for k, v in os.environ.items() if k != "YTDL_DATA_DIR"}
+    out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'backend'); "
+                          "from ytdl import manager; print(manager.DATA_DIR)"],
+                         cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[-500:]
+    assert Path(out.stdout.strip()) == ROOT / "data"
 
 
 # ---------- API protection (a real server process)

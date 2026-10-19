@@ -39,7 +39,8 @@ from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
 from yt_dlp.utils import ContentTooShortError, DownloadCancelled, ExtractorError, GeoRestrictedError, download_range_func
 
-DATA_DIR = Path(os.environ.get("YTDL_DATA_DIR") or Path(__file__).parent / "data")
+ROOT = Path(__file__).resolve().parents[2]               # the repo: backend/ytdl/ -> ../..
+DATA_DIR = Path(os.environ.get("YTDL_DATA_DIR") or ROOT / "data")   # the library stays in <repo>/data
 DB_FILE = DATA_DIR / "library.db"
 DB_BACKUP = DATA_DIR / "library.backup.db"
 LEGACY_STATE = DATA_DIR / "state.json"            # pre-SQLite library, migrated on first start

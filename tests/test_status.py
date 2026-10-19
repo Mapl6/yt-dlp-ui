@@ -3,7 +3,7 @@ re-queue path: each one goes through _requeue, so a missing or damaged file is d
 three retry counters start again."""
 import pytest
 
-import manager as M
+from ytdl import manager as M
 from helpers import items_of, make_job, wait
 
 OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": False, "numbering": False}

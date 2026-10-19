@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import manager as M
+from ytdl import manager as M
 from helpers import entry, wait
 
 key = M.Manager._archive_key

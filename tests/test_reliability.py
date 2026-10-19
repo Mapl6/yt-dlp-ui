@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-import manager as M
+from ytdl import manager as M
 from helpers import wait_status
 
 OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": False, "numbering": False}

@@ -33,7 +33,7 @@ step() {   # step <name> <command…>
 }
 
 syntax() {
-  "$py" -m py_compile manager.py server.py netcheck.py mac_app.py tests/*.py tests/e2e/*.py || return 1
+  "$py" -m compileall -q backend server.py mac_app.py tests || return 1
   local f ok=0
   for f in static/js/*.js tests/ui/*.mjs tests/e2e/*.mjs; do node --check "$f" || ok=1; done
   return $ok

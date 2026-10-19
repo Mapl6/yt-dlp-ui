@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-import manager as M
+from ytdl import manager as M
 from helpers import stop_manager
 
 VALUES = {"concurrency": 5, "cookies_browser": "firefox", "cookies_profile": "abc.default-release",

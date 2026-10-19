@@ -11,8 +11,8 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from yt_dlp.utils import DownloadError
 
-import manager as M
-import server
+from ytdl import manager as M
+from ytdl import server
 from helpers import ROOT, items_of, make_job, wait
 
 
@@ -85,7 +85,7 @@ ROUTES = api_routes()
 
 
 def test_every_route_is_listed():
-    declared = re.findall(r'^@app\.(?:get|post|put|delete)\("/api/', (ROOT / "server.py").read_text(), re.M)
+    declared = re.findall(r'^@app\.(?:get|post|put|delete)\("/api/', (ROOT / "backend" / "ytdl" / "server.py").read_text(), re.M)
     assert len(ROUTES) == len(declared) > 30, f"{len(ROUTES)} routes registered, {len(declared)} declared"
 
 

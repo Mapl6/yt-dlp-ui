@@ -4,7 +4,7 @@ import socket
 
 import pytest
 
-import netcheck
+from ytdl import netcheck
 from helpers import serve, wait
 
 

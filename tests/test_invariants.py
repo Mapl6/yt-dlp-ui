@@ -6,7 +6,7 @@ import textwrap
 
 import pytest
 
-import manager as M
+from ytdl import manager as M
 from helpers import ROOT, items_of, make_job, wait
 
 OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": False, "numbering": False}
@@ -131,8 +131,8 @@ def test_different_folders_may_download_together(mgr, net, out, tmp_path):
 
 CRASH = textwrap.dedent("""
     import os, sys, time
-    sys.path.insert(0, sys.argv[1])
-    import manager as M
+    sys.path.insert(0, sys.argv[1] + "/backend")
+    from ytdl import manager as M
     m = M.Manager()
     m.net_level = lambda: "offline"
     with m.cond:

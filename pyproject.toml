@@ -10,7 +10,7 @@ markers = [
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.coverage.run]
-source = ["manager", "server", "netcheck"]
+source = ["ytdl"]
 concurrency = ["thread"]
 
 [tool.coverage.report]

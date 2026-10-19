@@ -9,11 +9,8 @@ The media server also answers GET /__throttle/on and /__throttle/off (slow every
 download while it runs).
 """
 import argparse
-import http.server
 import os
-import runpy
 import sys
-import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,10 +30,10 @@ os.environ["YTDL_DATA_DIR"] = str(work / "data")
 settings = work / "data" / "settings.json"
 if not settings.exists():
     settings.write_text('{"output_dir": "%s"}' % (work / "out"))
-sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
+sys.path[:0] = [str(ROOT / "backend"), str(ROOT / "tests")]
 
-import manager as M  # noqa: E402
-import netcheck  # noqa: E402
+from ytdl import manager as M  # noqa: E402
+from ytdl import netcheck  # noqa: E402
 from yt_dlp.utils import DownloadError  # noqa: E402
 
 from helpers import FakeExtractor, MediaServer, ff  # noqa: E402
@@ -103,8 +100,9 @@ class Online:
                 "speed": self._get_speed(), "peak_speed": 0, "history": []}
 
 
-netcheck.NetMonitor = Online
-threading.current_thread().name = "fake-app"
+netcheck.NetMonitor = Online           # before ytdl.server imports it
+from ytdl import server as app  # noqa: E402
+
 print(f"fake app: http://127.0.0.1:{args.port}  media :{server.port}  data {work}", flush=True)
 sys.argv = [str(ROOT / "server.py"), "--port", str(args.port), "--no-browser"]
-runpy.run_path(str(ROOT / "server.py"), run_name="__main__")
+app.main()
