@@ -1,9 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/bin/python tests/test_core.py)",
-      "Bash(.venv/bin/python tests/test_reliability.py)",
-      "Bash(.venv/bin/python tests/test_health.py)",
+      "Bash(scripts/test.sh)",
+      "Bash(scripts/test.sh --fast)",
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(npx vitest run:*)",
       "Bash(.venv/bin/python -m py_compile:*)",
       "Bash(node --check:*)",
       "Bash(.venv/bin/python .claude/skills/verify-downloads/scripts/verify_folder.py:*)",

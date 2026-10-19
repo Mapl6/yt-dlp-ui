@@ -13,23 +13,36 @@ A local web app (FastAPI + yt-dlp, vanilla JS front end) for downloading YouTube
 ./run-mac.sh                               # optional Mac app (pywebview window + menu-bar icon); run.bat / run.ps1 on Windows
 .venv/bin/python server.py --port 8799 --no-browser   # run a second instance for testing (see "Testing safely")
 
-.venv/bin/python tests/test_core.py        # merge/numbering, format opts, error kinds, SQLite, logs, API security
-.venv/bin/python tests/test_reliability.py # flaky-server resume, offline gating, verification, locks, DB recovery
-.venv/bin/python tests/test_health.py      # Check files, Clean up, stream-size check, re-merge from kept streams
-.venv/bin/python tests/test_features.py    # queue control, event log, schedule, speed limits, file actions, SponsorBlock, parts, sync
-node tests/test_ui.mjs                     # page logic: range selector, filters/sorting, formatters, stats buckets
+scripts/test.sh                            # everything: syntax, pytest + coverage, Vitest, Playwright (~1 min)
+scripts/test.sh --fast                     # no real downloads, server processes or browser (~20 s)
+.venv/bin/python -m pytest tests/test_status.py -k requeue   # one file / selected tests
+.venv/bin/python -m pytest -n auto --dist loadfile --cov      # all Python tests in parallel, with coverage
+npx vitest run                             # page logic: range selector, filters/sorting, formatters, stats buckets
+E2E_CHANNEL=chrome npx playwright test     # the page in a browser (E2E_CHANNEL: use the installed Chrome)
 ```
 
-Tests are plain scripts (no pytest): each prints `PASS`/`FAIL` lines and exits non-zero on failure. They need `ffmpeg`/`ffprobe` but no internet: they use local HTTP servers and, in `test_health.py`, a patched `YoutubeDL.extract_info` that serves a fabricated video with separate video and audio formats. A test file takes the repo root as an optional argument. To run one check, comment out the others in the script; there is no test selector. Tracebacks about `BrokenPipeError`/`ConnectionResetError` in the output are expected: the flaky server drops connections on purpose.
+Python tests (`tests/test_*.py`, pytest; dev deps in `requirements-dev.txt`):
 
-Syntax checks: `node --check` on each `static/js/*.js`, `.venv/bin/python -m py_compile manager.py server.py netcheck.py mac_app.py`. `mac_app.py --smoke` (needs pywebview, e.g. a scratch venv with `requirements-mac.txt`) opens the window, checks the page and quits.
+- `test_core` (merge/numbering, format opts, error kinds, SQLite, logs, real-server API protection);
+- `test_reliability` (resume on a flaky server, offline, rate limiting, cookie errors, locks);
+- `test_health` (Check files, Clean up, stream sizes, re-merge);
+- `test_features` (queue control, event log, schedule, speed limits, file actions, SponsorBlock, parts, sync, export/import, cookies.txt);
+- `test_api` (every route: token, Host guard, password, errors, route order);
+- `test_status` (status flow, every re-queue path);
+- `test_invariants` (archive only after verification, never twice at once, crash recovery, deletes by `[id]`);
+- `test_settings`;
+- `test_netcheck`.
+
+They need `ffmpeg`/`ffprobe` but no internet: fixtures in `tests/conftest.py` and `tests/helpers.py` give each module its own scratch library and `Manager`, ffmpeg-made clips, local media and flaky servers, and a fake extractor for `test://<id>` videos. Coverage must stay at or above `fail_under` in `pyproject.toml`. Page logic is tested with Vitest (`tests/ui/`). End-to-end tests (`tests/e2e/`, Playwright) run the real `server.py` through `tests/e2e/fake_app.py` on port 8798 with a scratch library and a fake YouTube. Tracebacks about `BrokenPipeError`/`ConnectionResetError` are expected: the flaky server drops connections on purpose.
+
+Syntax checks (part of `scripts/test.sh`): `node --check` on each `static/js/*.js`, `.venv/bin/python -m py_compile manager.py server.py netcheck.py mac_app.py`. `mac_app.py --smoke` (needs pywebview, e.g. a scratch venv with `requirements-mac.txt`) opens the window, checks the page and quits.
 
 ## Project rules and skills (`.claude/`)
 
 - `rules/safety.md` (always loaded): never run against `data/` or the user's download folders. This repo has already had a test server write into the user's real folder.
 - Path-scoped rules load with the matching files:
   - `rules/download-core.md`: the invariants in `manager.py`/`server.py`;
-  - `rules/testing.md`: test-script conventions;
+  - `rules/testing.md`: test conventions (fixtures, isolation, Vitest, Playwright);
   - `rules/frontend.md`: `static/` conventions.
 - Skills:
   - `safe-test-server`: run the app on a sanitized copy of the library;

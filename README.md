@@ -108,7 +108,7 @@ Downloads are built so that nothing is lost when the connection drops:
 - **Safe library.** The library is a SQLite database that survives crashes and power loss, and each save writes only what changed. A backup is made every 10 minutes; a damaged database is kept aside and the backup is loaded.
 - **No double downloads.** Only one copy of the app can use a library, and a video locked by another copy (for example, a second library saving to the same folder) waits instead of writing the same file twice.
 
-Run the tests (no internet needed): `tests/test_core.py`, `tests/test_reliability.py`, `tests/test_health.py` and `tests/test_features.py` with `.venv/bin/python`, and `node tests/test_ui.mjs` for the page.
+Run the tests with `scripts/test.sh` (no internet needed once the test tools are installed; needs Node.js for the page tests). The app itself still needs only Python.
 
 ## Security
 

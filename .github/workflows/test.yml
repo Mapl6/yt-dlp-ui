@@ -1,0 +1,59 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: all tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install ffmpeg
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install ffmpeg
+          else sudo apt-get update -q && sudo apt-get install -y -q ffmpeg; fi
+      - name: Install test tools
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -q -r requirements-dev.txt
+          npm ci
+          npx playwright install --with-deps chromium
+      - run: scripts/test.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-${{ matrix.os }}
+          path: |
+            test-results/
+            playwright-report/
+
+  # Windows has never been tested (run.bat, run.ps1, the msvcrt locks). Report, don't block, until it passes.
+  windows:
+    name: Python tests (windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: choco install ffmpeg -y --no-progress
+      - run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install -q -r requirements-dev.txt
+          .venv\Scripts\python -m pytest -q -n auto --dist loadfile
