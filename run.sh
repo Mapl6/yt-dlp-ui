@@ -28,7 +28,7 @@ if [ "${1:-}" = "--dev" ]; then
   for ((i = 1; i <= $#; i++)); do [ "${!i}" = "--port" ] && { j=$((i + 1)); port=${!j}; }; done
   .venv/bin/python server.py --dev --no-browser "$@" &
   backend=$!
-  NEXT_BASE_PATH="" YTDL_BACKEND="http://127.0.0.1:$port" npx next dev frontend --port 3000 &
+  YTDL_BACKEND="http://127.0.0.1:$port" npx next dev frontend --port 3000 &
   front=$!
   trap 'kill $backend $front 2>/dev/null; wait 2>/dev/null' EXIT INT TERM   # Ctrl+C stops both
   echo "Dev mode: page at http://localhost:3000 (edits reload it), API at http://127.0.0.1:$port"

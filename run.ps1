@@ -35,7 +35,7 @@ if ($args.Count -gt 0 -and $args[0] -eq "--dev") {
     $port = 8765
     $i = [array]::IndexOf($rest, "--port"); if ($i -ge 0) { $port = $rest[$i + 1] }
     $backend = Start-Process -FilePath $python -ArgumentList (@("server.py", "--dev", "--no-browser") + $rest) -NoNewWindow -PassThru
-    $env:NEXT_BASE_PATH = ""; $env:YTDL_BACKEND = "http://127.0.0.1:$port"
+    $env:YTDL_BACKEND = "http://127.0.0.1:$port"
     $front = Start-Process -FilePath "npx.cmd" -ArgumentList @("next", "dev", "frontend", "--port", "3000") -NoNewWindow -PassThru
     Write-Host "Dev mode: page at http://localhost:3000 (edits reload it), API at http://127.0.0.1:$port"
     try { Wait-Process -Id $backend.Id, $front.Id -ErrorAction SilentlyContinue }

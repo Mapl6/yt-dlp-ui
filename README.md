@@ -108,7 +108,18 @@ Downloads are built so that nothing is lost when the connection drops:
 - **Safe library.** The library is a SQLite database that survives crashes and power loss, and each save writes only what changed. A backup is made every 10 minutes; a damaged database is kept aside and the backup is loaded.
 - **No double downloads.** Only one copy of the app can use a library, and a video locked by another copy (for example, a second library saving to the same folder) waits instead of writing the same file twice.
 
-Run the tests with `scripts/test.sh` (no internet needed once the test tools are installed; needs Node.js for the page tests). The app itself still needs only Python.
+For the tests, see Development below.
+
+## Development
+
+The page is a Next.js app in `frontend/`, built to static files in `frontend/out/`, which are committed, so running the app needs only Python. The backend is in `backend/ytdl/`. To change the page you need Node.js:
+
+```bash
+npm ci               # once: the build and test tools
+./run.sh --dev       # the backend plus next dev at http://localhost:3000; the page reloads as you edit
+npm run build        # rebuild frontend/out, and commit it with your changes
+scripts/test.sh      # every test, offline (--fast for a quick run)
+```
 
 ## Security
 

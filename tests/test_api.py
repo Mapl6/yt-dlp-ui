@@ -141,16 +141,20 @@ def test_route_order_specific_job_routes_first():
     assert log_route < item_catch or "GET" not in paths[item_catch][1]
 
 
-def test_index_injects_token_and_versions(api):
+def test_index_is_the_built_page_with_the_token(api):
     r = api.get("/")
-    assert r.status_code == 200 and f'name="api-token" content="{auth.TOKEN}"' in r.text
-    assert r.headers["cache-control"] == "no-store"
-    assert re.search(r'/static/js/main\.js\?v=\d+', r.text), "main.js gets a version so no stale copy runs"
+    assert r.status_code == 200 and r.text.count('name="api-token"') == 1
+    assert f'<meta name="api-token" content="{auth.TOKEN}"/>' in r.text.split("</head>")[0], "the token goes in <head>"
+    assert r.headers["cache-control"] == "no-store", "never cached: an update must never run an old page"
 
 
-def test_static_files_revalidate(api):
-    r = api.get("/static/js/main.js")
-    assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
+def test_built_assets_are_served(api):
+    page = api.get("/").text
+    assets = re.findall(r'(?:src|href)="(/_next/static/[^"]+\.(?:js|css))"', page)
+    assert any(a.endswith(".css") for a in assets) and any(a.endswith(".js") for a in assets), assets
+    for a in assets:
+        assert api.get(a).status_code == 200, a
+    assert api.get("/static/js/main.js").status_code == 404, "the old page is gone"
 
 
 # ---------- password (network mode)
@@ -455,12 +459,3 @@ def test_dev_token_only_in_dev_mode(api, anon, monkeypatch):
     assert r.status_code == 200 and r.json() == {"token": auth.TOKEN}
     assert anon.get("/api/overview").status_code == 403, "every other route still needs the token"
     assert anon.get("/api/dev-token", headers={"Host": "evil.example"}).status_code == 403, "and the Host check applies"
-
-
-def test_next_page_gets_the_token(api):
-    r = api.get("/next/")
-    assert r.status_code == 200 and f'<meta name="api-token" content="{auth.TOKEN}"/>' in r.text
-    assert r.headers["cache-control"] == "no-store"
-    assert api.get("/next", follow_redirects=False).headers["location"] == "/next/"
-    asset = re.search(r'src="(/next/_next/static/[^"]+\.js)"', r.text)
-    assert asset and api.get(asset.group(1)).status_code == 200, "the built scripts are served"

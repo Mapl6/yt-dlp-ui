@@ -32,10 +32,11 @@ paths:
   Real `server.py` processes (startup and port checks) are marked `server`. Real downloads are marked `slow`; `scripts/test.sh --fast` skips both.
 - **Wait with `wait()`/`wait_status()`** and generous timeouts, never fixed sleeps for completion.
 - **Coverage has a floor** (`fail_under` in `pyproject.toml`). Don't lower it; raise it when you close gaps.
-- **Page logic** (`frontend/static/js/util.js`, `filters.js`, the `buckets` export of `stats.js`) is tested with Vitest in `tests/ui/*.test.mjs`. Keep those modules free of DOM access at import time.
+- **Page logic** (`frontend/lib/util.ts`, `filters.ts`, the `buckets` export of `stats.ts`) is tested with Vitest in `tests/ui/*.test.mjs`. Keep those modules free of DOM and React at import time.
 - **End-to-end tests** (`tests/e2e/*.spec.mjs`, Playwright):
   - they run the real page and `server.py` through `tests/e2e/fake_app.py`, on port 8798 (never 8765) with a scratch library and a fake YouTube (`https://e2e.test/list/<name>/<n>`, `https://e2e.test/bot/<n>`, `GET /__throttle/on|off` on the media port);
   - the tests run in order on one app;
-  - find elements by role, label and text, not CSS classes or ids, so the same tests can check the Next.js port. The playlist card container (`.job`) is the exception.
+  - they drive the built page (`frontend/out`): `scripts/test.sh` builds it first;
+  - find elements by role, label and text, not CSS classes or ids, so a change of markup doesn't break them. The playlist card container (`.job`) is the exception.
   - `E2E_CHANNEL=chrome` uses the installed Google Chrome when Playwright's own browser can't be downloaded.
 - **Run everything before claiming something works:** `scripts/test.sh` (the `run-tests` skill). Run the Python suite twice when touching the scheduler, locks or timing.

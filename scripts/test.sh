@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run every test: syntax checks, pytest (with coverage), Vitest (page logic), the page build (Next.js, committed),
-# Playwright (both pages in a browser).
+# Playwright (the page in a browser).
 #   scripts/test.sh          everything
 #   scripts/test.sh --fast   skip real downloads, real server processes and the browser tests
 # Offline once the dependencies are installed; needs ffmpeg. Never touches data/ or your download folders.
@@ -36,7 +36,7 @@ step() {   # step <name> <command…>
 syntax() {
   "$py" -m compileall -q backend server.py mac_app.py tests || return 1
   local f ok=0
-  for f in frontend/static/js/*.js tests/ui/*.mjs tests/e2e/*.mjs; do node --check "$f" || ok=1; done
+  for f in tests/ui/*.mjs tests/e2e/*.mjs; do node --check "$f" || ok=1; done   # the page is type-checked by its build
   return $ok
 }
 
@@ -60,6 +60,7 @@ build() {   # the page is built into frontend/out and committed: users need only
 }
 
 step "syntax" syntax
+[ $fast = 0 ] && step "build" build      # first: the server tests and Playwright use the built page
 if [ $fast = 1 ]; then
   step "pytest (fast)" "$py" -m pytest -q -n auto --dist loadfile -m "not slow and not server"
 else
@@ -67,7 +68,6 @@ else
 fi
 step "vitest" npx vitest run
 if [ $fast = 0 ]; then
-  step "build" build
   if browser; then
     lsof -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1 && echo "(Your own app is running on 8765; the tests use their own port and library.)"
     step "playwright" npx playwright test

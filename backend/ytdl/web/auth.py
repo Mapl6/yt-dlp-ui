@@ -45,10 +45,7 @@ async def guard(request: Request, call_next):
         sent = request.query_params.get("token", "") if path == "/api/stream" else request.headers.get("x-token", "")
         if not secrets.compare_digest(sent, TOKEN):
             return JSONResponse({"detail": "Session expired — reload the page."}, status_code=403)
-    response = await call_next(request)
-    if path.startswith("/static/"):
-        response.headers["Cache-Control"] = "no-cache"   # always revalidate: an update must never run old code
-    return response
+    return await call_next(request)
 
 
 LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A local web app (FastAPI + yt-dlp, vanilla JS front end) for downloading YouTube videos, playlists and channels. Playlists are saved to a library first; the user then picks which videos to download. Its main design goal is reliability on weak or interrupted internet: nothing is lost and no damaged file ever counts as downloaded.
+A local web app (FastAPI + yt-dlp, Next.js front end built to static files) for downloading YouTube videos, playlists and channels. Playlists are saved to a library first; the user then picks which videos to download. Its main design goal is reliability on weak or interrupted internet: nothing is lost and no damaged file ever counts as downloaded.
 
 ## Commands
 
@@ -13,7 +13,9 @@ A local web app (FastAPI + yt-dlp, vanilla JS front end) for downloading YouTube
 ./run-mac.sh                               # optional Mac app (pywebview window + menu-bar icon); run.bat / run.ps1 on Windows
 .venv/bin/python server.py --port 8799 --no-browser   # run a second instance for testing (see "Testing safely")
 
-scripts/test.sh                            # everything: syntax, pytest + coverage, Vitest, Playwright (~1 min)
+./run.sh --dev                             # front-end work: backend + next dev at http://localhost:3000 (needs Node.js)
+npm run build                              # rebuild the page into frontend/out (committed; CI checks it is current)
+scripts/test.sh                            # everything: syntax, build, pytest + coverage, Vitest, Playwright (~1 min)
 scripts/test.sh --fast                     # no real downloads, server processes or browser (~20 s)
 .venv/bin/python -m pytest tests/test_status.py -k requeue   # one file / selected tests
 .venv/bin/python -m pytest -n auto --dist loadfile --cov      # all Python tests in parallel, with coverage
@@ -35,7 +37,7 @@ Python tests (`tests/test_*.py`, pytest; dev deps in `requirements-dev.txt`):
 
 They need `ffmpeg`/`ffprobe` but no internet: fixtures in `tests/conftest.py` and `tests/helpers.py` give each module its own scratch library and `Manager`, ffmpeg-made clips, local media and flaky servers, and a fake extractor for `test://<id>` videos. Coverage must stay at or above `fail_under` in `pyproject.toml`. Page logic is tested with Vitest (`tests/ui/`). End-to-end tests (`tests/e2e/`, Playwright) run the real server through `tests/e2e/fake_app.py` on port 8798 with a scratch library and a fake YouTube. Tracebacks about `BrokenPipeError`/`ConnectionResetError` are expected: the flaky server drops connections on purpose.
 
-Syntax checks (part of `scripts/test.sh`): `node --check` on each `frontend/static/js/*.js`, `.venv/bin/python -m compileall -q backend server.py mac_app.py tests`. `mac_app.py --smoke` (needs pywebview, e.g. a scratch venv with `requirements-mac.txt`) opens the window, checks the page and quits.
+Syntax checks (part of `scripts/test.sh`): `.venv/bin/python -m compileall -q backend server.py mac_app.py tests` and `node --check` on the test files; the page is type-checked by its build. `mac_app.py --smoke` (needs pywebview, e.g. a scratch venv with `requirements-mac.txt`) opens the window, checks the page and quits.
 
 ## Project rules and skills (`.claude/`)
 
@@ -65,7 +67,7 @@ Layout:
     - plus `constants`;
   - `netcheck.py`;
   - `web/`: `engine` (the running Manager and NetMonitor), `auth` (Host guard, token, password), `app` (FastAPI app, page, static files), `routes/` (live, queue, settings, library, jobs), `main` (command line).
-- `frontend/static/`: the page.
+- `frontend/`: the page (Next.js; see below), and its committed build `frontend/out/`.
 
 Code that tests patch is called through its module (`verify._verify_file`, `extract.inspect_url`, `files._open_path`), so one patch reaches every caller. Keep it that way.
 
@@ -129,7 +131,12 @@ Code that tests patch is called through its module (`verify._verify_file`, `extr
 
 **`backend/ytdl/netcheck.py`**: `NetMonitor` probes Google and YouTube `generate_204` every 10 s through the configured proxy. It classifies the connection as excellent, good, fair, weak, blocked or offline, and calls `on_change(old, new)`.
 
-**`frontend/static/js/`**: ES modules, no framework or build step (see `rules/frontend.md`). `main.js` receives updates from the SSE stream (polling as fallback) and hands them to `library.js` (one view per playlist card; the body comes from `<template id="tpl-body">`, built lazily; rows drawn by the `VList` virtual list from `items?since=`), `dashboard.js` (+ `stats.js`, `charts.js`) and `netpanel.js`. HTML is only replaced when it changes, so clicks aren't lost mid-update.
+**`frontend/`**: Next.js (App Router, TypeScript, React), exported to static files (`frontend/out`, committed) that `web/app.py` serves at `/` with the token added to `<head>` (see `rules/frontend.md`). `components/Main.tsx` receives updates from the SSE stream (polling as fallback) and shares them through `AppContext`. The parts:
+- `Library` / `JobBody`: one card per playlist; the body is built on first open; rows are drawn by `VirtualList` from `items?since=`;
+- `Dashboard` (+ `StatsView`, `charts`);
+- `NetPanel`, `SettingsDialog`, and the small `dialogs`.
+
+Rows are memoised with stable keys and props, so clicks aren't lost mid-update. In development `next dev` proxies `/api` to the backend started with `--dev`, which hands out the token at `/api/dev-token`.
 
 **`mac_app.py`** (optional): runs the same server in a thread and shows it in a pywebview window. It patches pywebview's Cocoa app delegate so ⌘Q quits and the Dock icon reopens the hidden window, and adds an `NSStatusItem` menu. `scripts/make_mac_app.sh` builds a thin `.app` launcher that runs `run-mac.sh`.
 

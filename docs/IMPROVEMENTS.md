@@ -4,16 +4,7 @@ Last updated 2026-10-19. Open work first; finished work is summarized at the end
 
 ## Next up
 
-On a branch from `main`. The full test suite and the split backend are done (see below); run `scripts/test.sh` after every step.
-
-### 1. Move the front end to Next.js
-
-- Port `frontend/static/js/` (about 3,500 lines of ES modules) to Next.js with React, one module at a time: shared logic (API client and live updates, formatters, filters, stats), dialogs and menus, Settings, network panel, dashboard and charts, library cards with the virtual list, notifications and shortcuts.
-- Keep what the page does now: live updates over `/api/stream` with polling as a fallback, `items?since=rev`, updates that never lose a click, keyboard shortcuts, phone layout, dark mode.
-- Build to static files (`output: "export"`) and **commit the build**, so users still need only Python, it works offline, and the Mac app needs no change. CI checks the committed build is current.
-- The backend keeps injecting the `X-Token` into the exported `index.html`. For development, `next dev` proxies `/api` to the backend, which then offers the token on a dev-only route.
-- Serve the new page beside the old one until the end-to-end tests (`tests/e2e/`) pass on both, then switch and delete `frontend/static/`.
-- One script still starts everything: `run.sh --dev` (and `run.bat` / `run.ps1` / `run-mac.sh`) starts the backend and `next dev`, and stops both on Ctrl+C. Without `--dev`, only Python runs and serves the committed build.
+The tests, the split backend and the Next.js page are done (see below). Run `scripts/test.sh` after every change.
 
 ### Later
 
@@ -40,6 +31,14 @@ On a branch from `main`. The full test suite and the split backend are done (see
 - A "Downloaded" badge on the Mac app's Dock icon.
 
 ## Done
+
+### 2026-10-19: the page in Next.js
+
+- `frontend/`: Next.js 16 (App Router, TypeScript, React 19) with the same markup and stylesheet as before, so it looks and behaves the same.
+- Built to static files in `frontend/out`, which are committed: running the app still needs only Python, and the Mac app is unchanged. The build is reproducible, and CI fails when the committed build is out of date.
+- Ported module by module behind `/next/`, with the same Playwright tests passing on the old page and the new one, then switched; the old `static/` is gone. Screenshots of both pages matched.
+- The server adds the token to the page's `<head>`. React doesn't render that tag, because React 19 adds a second, empty copy when it hydrates.
+- `./run.sh --dev`: the backend plus `next dev` with hot reload. The page gets its token from `/api/dev-token`, which exists only with `--dev`.
 
 ### 2026-10-19: backend split into modules
 
