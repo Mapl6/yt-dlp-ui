@@ -13,7 +13,8 @@ from yt_dlp.utils import DownloadError
 
 from ytdl import extract, files, ytdlp
 from ytdl import manager as M
-from ytdl import server
+from ytdl.web import app as webapp
+from ytdl.web import auth, engine
 from helpers import ROOT, items_of, make_job, wait
 
 
@@ -38,18 +39,18 @@ def netstub():
 
 @pytest.fixture(scope="module")
 def api(mgr, netstub):
-    prev = server.manager, server.net, server.runtime["server"]
-    server.manager, server.net = mgr, netstub
-    with TestClient(server.app, base_url="http://127.0.0.1") as client:
-        client.headers["X-Token"] = server.TOKEN
+    prev = engine.manager, engine.net, engine.runtime["server"]
+    engine.manager, engine.net = mgr, netstub
+    with TestClient(webapp.app, base_url="http://127.0.0.1") as client:
+        client.headers["X-Token"] = auth.TOKEN
         yield client
-    server.manager, server.net, server.runtime["server"] = prev
+    engine.manager, engine.net, engine.runtime["server"] = prev
 
 
 @pytest.fixture
 def anon(api):
     """The same app without the token header."""
-    with TestClient(server.app, base_url="http://127.0.0.1") as client:
+    with TestClient(webapp.app, base_url="http://127.0.0.1") as client:
         yield client
 
 
@@ -71,10 +72,20 @@ def fake_inspect(monkeypatch):
     monkeypatch.setattr(extract, "inspect_url", inspect)
 
 
+def all_routes(routes=None):
+    """Every route in matching order; FastAPI keeps an included router as one entry (original_router)."""
+    for r in webapp.app.routes if routes is None else routes:
+        inner = getattr(r, "original_router", None)
+        if inner is not None:
+            yield from all_routes(inner.routes)
+        else:
+            yield r
+
+
 def api_routes():
     """(method, path with sample parameters) for every /api route."""
     out = []
-    for r in server.app.routes:
+    for r in all_routes():
         if isinstance(r, APIRoute) and r.path.startswith("/api/"):
             path = r.path.replace("{job_id}", "nojob").replace("{item_id}", "noitem").replace("{action}", "noaction")
             for m in sorted(r.methods):
@@ -86,7 +97,8 @@ ROUTES = api_routes()
 
 
 def test_every_route_is_listed():
-    declared = re.findall(r'^@app\.(?:get|post|put|delete)\("/api/', (ROOT / "backend" / "ytdl" / "server.py").read_text(), re.M)
+    source = "".join(p.read_text() for p in (ROOT / "backend" / "ytdl" / "web").rglob("*.py"))
+    declared = re.findall(r'^@(?:app|router)\.(?:get|post|put|delete)\("/api/', source, re.M)
     assert len(ROUTES) == len(declared) > 30, f"{len(ROUTES)} routes registered, {len(declared)} declared"
 
 
@@ -114,13 +126,13 @@ def test_loopback_hosts_allowed(api, host):
 
 
 def test_any_host_when_serving_on_the_network(api, monkeypatch):
-    monkeypatch.setitem(server.security, "any_host", True)
+    monkeypatch.setitem(auth.security, "any_host", True)
     assert api.get("/api/overview", headers={"Host": "192.168.1.20:8765"}).status_code == 200
 
 
 def test_route_order_specific_job_routes_first():
     """The catch-all POST /api/jobs/{job_id}/{action} would swallow any job route declared after it."""
-    paths = [(r.path, r.methods) for r in server.app.routes if isinstance(r, APIRoute)]
+    paths = [(r.path, r.methods) for r in all_routes() if isinstance(r, APIRoute)]
     catch_all = next(i for i, (p, m) in enumerate(paths) if p == "/api/jobs/{job_id}/{action}" and "POST" in m)
     later = [p for p, m in paths[catch_all + 1:] if p.startswith("/api/jobs/")]
     assert not later, f"job routes declared after the catch-all: {later}"
@@ -131,7 +143,7 @@ def test_route_order_specific_job_routes_first():
 
 def test_index_injects_token_and_versions(api):
     r = api.get("/")
-    assert r.status_code == 200 and f'name="api-token" content="{server.TOKEN}"' in r.text
+    assert r.status_code == 200 and f'name="api-token" content="{auth.TOKEN}"' in r.text
     assert r.headers["cache-control"] == "no-store"
     assert re.search(r'/static/js/main\.js\?v=\d+', r.text), "main.js gets a version so no stale copy runs"
 
@@ -145,11 +157,11 @@ def test_static_files_revalidate(api):
 
 @pytest.fixture
 def password(monkeypatch):
-    monkeypatch.setitem(server.security, "password", "s3cret")
-    monkeypatch.setattr(server, "sessions", set())
-    server.login_failures.clear()
+    monkeypatch.setitem(auth.security, "password", "s3cret")
+    monkeypatch.setattr(auth, "sessions", set())
+    auth.login_failures.clear()
     yield "s3cret"
-    server.login_failures.clear()
+    auth.login_failures.clear()
 
 
 def test_password_redirects_page_and_refuses_api(api, password):
@@ -166,12 +178,12 @@ def test_password_login_sets_session(api, password):
     cookie = r.headers["set-cookie"].lower()
     assert "ytdl_session=" in cookie and "httponly" in cookie and "samesite=strict" in cookie
     session = r.cookies["ytdl_session"]
-    with TestClient(server.app, base_url="http://127.0.0.1", cookies={"ytdl_session": session}) as c:
+    with TestClient(webapp.app, base_url="http://127.0.0.1", cookies={"ytdl_session": session}) as c:
         page = c.get("/")
-        assert page.status_code == 200 and server.TOKEN in page.text
-        assert c.get("/api/overview", headers={"X-Token": server.TOKEN}).status_code == 200
+        assert page.status_code == 200 and auth.TOKEN in page.text
+        assert c.get("/api/overview", headers={"X-Token": auth.TOKEN}).status_code == 200
         assert c.get("/api/overview").status_code == 403, "a session still needs the token"
-    with TestClient(server.app, base_url="http://127.0.0.1", cookies={"ytdl_session": "forged"}) as c:
+    with TestClient(webapp.app, base_url="http://127.0.0.1", cookies={"ytdl_session": "forged"}) as c:
         assert c.get("/", follow_redirects=False).status_code == 303, "an unknown session is refused"
 
 
@@ -180,7 +192,7 @@ def test_password_rate_limit(api, password, monkeypatch):
     assert codes == [401] * 5 + [429], codes
     assert api.post("/login", content="password=s3cret").status_code == 429, "even the right one waits"
     now = time.time()
-    monkeypatch.setattr(server.time, "time", lambda: now + 61)
+    monkeypatch.setattr(auth.time, "time", lambda: now + 61)
     assert api.post("/login", content="password=s3cret", follow_redirects=False).status_code == 303, \
         "allowed again after a minute"
 
@@ -193,9 +205,9 @@ def test_login_without_password_set_refused(api):
 
 def test_stream_sends_snapshot_and_ends_on_shutdown(api):
     stopping = SimpleNamespace(should_exit=False)
-    server.runtime["server"] = stopping
+    engine.runtime["server"] = stopping
     try:
-        with api.stream("GET", f"/api/stream?token={server.TOKEN}", headers={"X-Token": ""}) as r:
+        with api.stream("GET", f"/api/stream?token={auth.TOKEN}", headers={"X-Token": ""}) as r:
             assert r.status_code == 200 and r.headers["content-type"].startswith("text/event-stream")
             lines = r.iter_lines()
             first = next(lines)
@@ -205,12 +217,12 @@ def test_stream_sends_snapshot_and_ends_on_shutdown(api):
             rest = list(lines)
             assert len([x for x in rest if x.startswith("data: ")]) <= 1
     finally:
-        server.runtime["server"] = None
+        engine.runtime["server"] = None
 
 
 def test_stream_token_only_in_query_on_stream(api, anon):
     assert anon.get("/api/stream").status_code == 403
-    assert anon.get(f"/api/overview?token={server.TOKEN}").status_code == 403
+    assert anon.get(f"/api/overview?token={auth.TOKEN}").status_code == 403
 
 
 # ---------- each route works

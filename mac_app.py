@@ -19,7 +19,8 @@ from pathlib import Path
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
-from ytdl import server  # noqa: E402
+from ytdl.web import engine  # noqa: E402
+from ytdl.web.app import app  # noqa: E402
 
 try:
     import webview
@@ -118,15 +119,15 @@ def make_status_item():
             show_window()
 
         def pauseAll_(self, sender):
-            server.manager.pause_all(True)
+            engine.manager.pause_all(True)
 
         def resumeAll_(self, sender):
-            server.manager.pause_all(False)
+            engine.manager.pause_all(False)
 
         def openFolder_(self, sender):
             from ytdl.files import _folder_problem, _open_folder
             import os
-            folder = os.path.expanduser(server.manager.settings["output_dir"])
+            folder = os.path.expanduser(engine.manager.settings["output_dir"])
             if not _folder_problem(folder):
                 _open_folder(folder)
 
@@ -155,7 +156,7 @@ def update_status_forever():
     from PyObjCTools import AppHelper
     while not state["quitting"]:
         try:
-            ov = server.manager.overview()
+            ov = engine.manager.overview()
             title = f"⇣{ov['active']}" if ov["active"] else "⇣"
             item = state["status"][0] if state["status"] else None
             if item:
@@ -196,10 +197,10 @@ def main():
     if not port_free(args.port):
         sys.exit(f"Port {args.port} is already in use — is YT Downloader already running? "
                  f"Open http://127.0.0.1:{args.port} or quit the other copy first.")
-    server.start_engine(args.port)
-    srv = uvicorn.Server(uvicorn.Config(server.app, host="127.0.0.1", port=args.port, log_level="warning",
+    engine.start_engine(args.port)
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="warning",
                                         timeout_graceful_shutdown=2))
-    server.runtime["server"] = srv
+    engine.runtime["server"] = srv
     threading.Thread(target=srv.run, name="web", daemon=True).start()
     if not wait_until_up(args.port):
         sys.exit("The downloader didn't start.")
@@ -216,7 +217,7 @@ def main():
     # the window is gone: stop the web server and save the library
     state["quitting"] = True
     srv.should_exit = True
-    server.manager.save_state()
+    engine.manager.save_state()
     time.sleep(0.5)
 
 

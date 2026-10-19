@@ -100,9 +100,9 @@ class Online:
                 "speed": self._get_speed(), "peak_speed": 0, "history": []}
 
 
-netcheck.NetMonitor = Online           # before ytdl.server imports it
-from ytdl import server as app  # noqa: E402
+netcheck.NetMonitor = Online           # before ytdl.web.engine imports it
+from ytdl.web.main import main  # noqa: E402
 
 print(f"fake app: http://127.0.0.1:{args.port}  media :{server.port}  data {work}", flush=True)
 sys.argv = [str(ROOT / "server.py"), "--port", str(args.port), "--no-browser"]
-app.main()
+main()
