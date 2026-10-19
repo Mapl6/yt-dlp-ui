@@ -1,6 +1,6 @@
 // stats.js buckets: History & stats per day and per week.
 import { expect, it } from "vitest";
-import { buckets } from "../../static/js/stats.js";
+import { buckets } from "../../frontend/static/js/stats.js";
 
 const today = new Date(2026, 9, 17);         // Saturday 17 October 2026
 const stats = { days: [{ day: "2026-10-17", done: 2, failed: 1, bytes: 300 }, { day: "2026-10-12", done: 1, failed: 0, bytes: 100 }] };

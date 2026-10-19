@@ -1,6 +1,6 @@
 // util.js: the range selector, link parsing, formatters and the tab title.
 import { describe, expect, it } from "vitest";
-import * as U from "../../static/js/util.js";
+import * as U from "../../frontend/static/js/util.js";
 
 const sorted = (s) => [...s].sort((a, b) => a - b);
 

@@ -12,7 +12,7 @@ from ..config import ROOT
 from . import auth, engine
 from .routes import jobs, library, live, queue, settings
 
-STATIC = ROOT / "static"
+STATIC = ROOT / "frontend" / "static"         # the page (until the Next.js build replaces it)
 
 
 @asynccontextmanager

@@ -1,6 +1,6 @@
 // filters.js: which videos can be selected, the tabs, search, length filters and sorting.
 import { describe, expect, it } from "vitest";
-import * as F from "../../static/js/filters.js";
+import * as F from "../../frontend/static/js/filters.js";
 
 const items = [
   { id: "a", index: 1, title: "Alpha", status: "done", duration: 300, finished: 50 },
