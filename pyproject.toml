@@ -1,0 +1,19 @@
+# Test configuration only: the app itself is run with ./run.sh (see README.md).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "server: starts a real server.py process",
+    "slow: takes more than a few seconds (real downloads)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["manager", "server", "netcheck"]
+concurrency = ["thread"]
+
+[tool.coverage.report]
+fail_under = 88          # measured 89% on 2026-10-18; raise it as gaps close
+show_missing = true
+skip_covered = true

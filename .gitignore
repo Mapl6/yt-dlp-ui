@@ -3,3 +3,10 @@ data/
 __pycache__/
 .playwright-mcp/
 dist/
+node_modules/
+test-results/
+playwright-report/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
