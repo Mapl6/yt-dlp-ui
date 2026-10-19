@@ -1,6 +1,6 @@
 ---
 name: run-tests
-description: Run all YT Downloader tests (syntax, pytest with coverage, Vitest page logic, Playwright end-to-end) and report a pass/fail summary. Use after any change to manager.py, server.py, netcheck.py, static/ or tests/, and before saying a change works.
+description: Run all YT Downloader tests (syntax, pytest with coverage, Vitest page logic, Playwright end-to-end) and report a pass/fail summary. Use after any change to backend/, frontend/, server.py, mac_app.py or tests/, and before saying a change works.
 ---
 
 # Run tests

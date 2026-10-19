@@ -1,27 +1,19 @@
 # YT Downloader — Improvement Plan
 
-Last updated 2026-10-18. Open work first; finished work is summarized at the end.
+Last updated 2026-10-19. Open work first; finished work is summarized at the end.
 
 ## Next up
 
-In this order, on a branch from `main`. The full test suite (done 2026-10-18, see below) is the safety net: run `scripts/test.sh` after every move.
+On a branch from `main`. The full test suite and the split backend are done (see below); run `scripts/test.sh` after every step.
 
-### 1. Restructure the backend; separate front and back end
+### 1. Move the front end to Next.js
 
-- Folders `backend/` and `frontend/`. The library stays in `<repo>/data/`.
-- Split `manager.py` (about 3,000 lines) into modules: config and paths, error kinds, settings, store (SQLite and backups), yt-dlp options and loggers, verification, files (archive, locks), cookies, and the `Manager` split by area (scheduler and queue, download pipeline, file health, sync, event log, file actions, export/import).
-- Split `server.py` into FastAPI routers. Keep the rule that specific job routes come before `POST /api/jobs/{job_id}/{action}`, with a test for it.
-- Move one piece at a time, with every test suite passing after each move; no behaviour changes in the same step.
-- One script still starts everything: `run.sh` / `run.bat` / `run.ps1` / `run-mac.sh` start the backend and, in dev mode, the front-end dev server, and stop both on Ctrl+C. `python server.py` keeps working (restart and the Mac app use it).
-- Update `CLAUDE.md`, the `.claude/rules/` paths and the skills (`safe-test-server`, `run-tests`).
-
-### 2. Move the front end to Next.js
-
-- Port `static/js/` (about 3,500 lines of ES modules) to Next.js with React, one module at a time: shared logic (API client and live updates, formatters, filters, stats), dialogs and menus, Settings, network panel, dashboard and charts, library cards with the virtual list, notifications and shortcuts.
+- Port `frontend/static/js/` (about 3,500 lines of ES modules) to Next.js with React, one module at a time: shared logic (API client and live updates, formatters, filters, stats), dialogs and menus, Settings, network panel, dashboard and charts, library cards with the virtual list, notifications and shortcuts.
 - Keep what the page does now: live updates over `/api/stream` with polling as a fallback, `items?since=rev`, updates that never lose a click, keyboard shortcuts, phone layout, dark mode.
 - Build to static files (`output: "export"`) and **commit the build**, so users still need only Python, it works offline, and the Mac app needs no change. CI checks the committed build is current.
 - The backend keeps injecting the `X-Token` into the exported `index.html`. For development, `next dev` proxies `/api` to the backend, which then offers the token on a dev-only route.
-- Serve the new page beside the old one until the end-to-end tests (`tests/e2e/`) pass on both, then switch and delete `static/`.
+- Serve the new page beside the old one until the end-to-end tests (`tests/e2e/`) pass on both, then switch and delete `frontend/static/`.
+- One script still starts everything: `run.sh --dev` (and `run.bat` / `run.ps1` / `run-mac.sh`) starts the backend and `next dev`, and stops both on Ctrl+C. Without `--dev`, only Python runs and serves the committed build.
 
 ### Later
 
@@ -33,7 +25,7 @@ In this order, on a branch from `main`. The full test suite (done 2026-10-18, se
 | Issue | Fix |
 | --- | --- |
 | **Windows is untested.** `run.bat`, `run.ps1` and the `msvcrt` file locks were only checked for syntax on macOS. | CI has a Windows job for the Python tests (`.github/workflows/test.yml`, not blocking yet); it runs once the repo is on GitHub. Make it pass, then make it required. |
-| **Coverage gaps** (89% overall, floor 88% in `pyproject.toml`). Not covered: reading real browser cookies (`check_cookies`), channel tabs in `inspect_url`, a failing automatic playlist check, `server.py` startup and restart (only run as a subprocess, which coverage doesn't measure). | Tests with a fake cookie database and a fake channel; measure subprocesses (`coverage` `patch = subprocess`). Raise the floor. |
+| **Coverage gaps** (89% overall, floor 88% in `pyproject.toml`). Not covered: reading real browser cookies (`check_cookies`), channel tabs in `inspect_url`, a failing automatic playlist check, `web/main.py` startup and restart (only run as a subprocess, which coverage doesn't measure). | Tests with a fake cookie database and a fake channel; measure subprocesses (`coverage` `patch = subprocess`). Raise the floor. |
 | **Retrying a video that isn't failed or queued says "Unknown action retry".** It is refused, as it should be, but the message is misleading. | A clear message, with a test. |
 | **Arc and Chrome Canary cookies rely on a private yt-dlp function.** `_register_extra_browsers` wraps `yt_dlp.cookies._get_chromium_based_browser_settings`; if yt-dlp renames it, those browsers silently disappear from Settings. | A check in the test suite after each yt-dlp update; `cookies.txt` import still works. |
 | **The Mac app's menu-bar icon is only checked by hand.** `mac_app.py --smoke` covers the window, the page and creating the icon, not clicking its menu. | A UI test with the Accessibility API, or keep checking by hand after changes. |
@@ -48,6 +40,16 @@ In this order, on a branch from `main`. The full test suite (done 2026-10-18, se
 - A "Downloaded" badge on the Mac app's Dock icon.
 
 ## Done
+
+### 2026-10-19: backend split into modules
+
+- `backend/ytdl/`:
+  - `config`, `errors`, `settings`, `util`, `files`, `verify`, `formats`, `ytdlp`, `cookies`, `extract`, `store`, `netcheck`;
+  - `manager/` (`Manager` from 13 mixins: core, queue, pipeline, health, library, sync, actions, import/export, events, views, persistence, options, updates);
+  - `web/` (engine, auth, app, routers, main).
+- The page moved to `frontend/static/`. The library stays in `<repo>/data`, with a test for it.
+- Moved by script, one commit per move, all tests passing after each: every line was kept (checked against the old files), and only imports changed, plus three references that had to name their new place.
+- `server.py` at the top is a launcher, so `run.sh`, Restart and the Mac app are unchanged.
 
 ### 2026-10-18: complete tests
 

@@ -32,7 +32,7 @@ paths:
   Real `server.py` processes (startup and port checks) are marked `server`. Real downloads are marked `slow`; `scripts/test.sh --fast` skips both.
 - **Wait with `wait()`/`wait_status()`** and generous timeouts, never fixed sleeps for completion.
 - **Coverage has a floor** (`fail_under` in `pyproject.toml`). Don't lower it; raise it when you close gaps.
-- **Page logic** (`static/js/util.js`, `filters.js`, the `buckets` export of `stats.js`) is tested with Vitest in `tests/ui/*.test.mjs`. Keep those modules free of DOM access at import time.
+- **Page logic** (`frontend/static/js/util.js`, `filters.js`, the `buckets` export of `stats.js`) is tested with Vitest in `tests/ui/*.test.mjs`. Keep those modules free of DOM access at import time.
 - **End-to-end tests** (`tests/e2e/*.spec.mjs`, Playwright):
   - they run the real page and `server.py` through `tests/e2e/fake_app.py`, on port 8798 (never 8765) with a scratch library and a fake YouTube (`https://e2e.test/list/<name>/<n>`, `https://e2e.test/bot/<n>`, `GET /__throttle/on|off` on the media port);
   - the tests run in order on one app;

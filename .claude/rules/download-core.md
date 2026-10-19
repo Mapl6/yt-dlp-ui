@@ -1,7 +1,6 @@
 ---
 paths:
-  - "manager.py"
-  - "netcheck.py"
+  - "backend/**"
   - "server.py"
 ---
 
@@ -19,10 +18,16 @@ These hold the reliability guarantees together. Breaking one silently loses or c
 - **Create every `YoutubeDL` through `_ytdl(opts)`,** never `yt_dlp.YoutubeDL` directly: it applies the imported cookies.txt as a private copy per instance.
 - **Keep the order of `_download` → `_download_locked`:** folder check, archive check, disk space, per-video `_FileLock`, re-check archive under the lock, yt-dlp, size check, verify, re-merge once from kept streams, delete streams, archive. The locks prevent two processes writing one `.part` file.
 - **`_merge` keeps `number` (file prefix) permanent** and only moves `index`. It doesn't flag removals when a fetch looks cut short.
-- **`server.py`:**
+- **The web server (`backend/ytdl/web/`):**
   - The engine starts in `start_engine()` only after the port bind check; don't create `Manager()` at import time.
   - Declare specific `/api/jobs/{id}/...` routes before the catch-all `POST /api/jobs/{job_id}/{action}`.
   - Every new `/api/*` route is covered by the `guard` token check automatically. Keep it that way.
 - **Bulk item updates** (`it.update(..., rev=...)` in a loop) must end with `_touch(job)` without an item, so the scheduler's `_live` index is rebuilt for that job.
 - **A part of a video** (`options.section`) never reads or writes the archive: it isn't the whole video.
+- **Module boundaries (`backend/ytdl/`):**
+  - read the library paths as `config.DATA_DIR`, `config.DB_FILE`… at call time, never `from .config import DATA_DIR`;
+  - call `verify._verify_file`, `extract.inspect_url` and `files._open_path` through their module (tests patch them there);
+  - leaf modules never import `manager` or `web`;
+  - a new `Manager` method goes in the mixin for its area;
+  - the instance state is created only in `Manager.__init__`.
 - **Changing these needs tests.** Add or adjust checks in `tests/` (see the testing rule) and run all suites (the `run-tests` skill).
