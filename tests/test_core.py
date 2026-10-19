@@ -18,13 +18,13 @@ from yt_dlp.networking import Response
 from yt_dlp.networking.exceptions import HTTPError, TransportError
 from yt_dlp.utils import DownloadError, ExtractorError, GeoRestrictedError
 
-from ytdl import manager as M
+from ytdl import config, errors, extract, formats, store
 from helpers import ROOT, entry
 
 
 def playlist(*entries):
     return {"kind": "playlist", "source_id": "PL1", "title": "Test list", "thumbnail": None,
-            "heights": M.VIDEO_HEIGHTS, "items": list(entries)}
+            "heights": formats.VIDEO_HEIGHTS, "items": list(entries)}
 
 
 @pytest.fixture(scope="module")
@@ -109,10 +109,10 @@ def test_queue_all_skips_unavailable(mgr, merged):
 
 
 def test_format_options():
-    o, pps = M.build_format_opts({"quality": "mp3"})
+    o, pps = formats.build_format_opts({"quality": "mp3"})
     ea = next(p for p in pps if p["key"] == "FFmpegExtractAudio")
     assert ea["preferredcodec"] == "mp3" and ea["preferredquality"] == "0", "format: mp3 extracts best-quality audio"
-    o, pps = M.build_format_opts({"quality": "720", "container": "mp4", "subtitles": True, "thumbnail": False})
+    o, pps = formats.build_format_opts({"quality": "720", "container": "mp4", "subtitles": True, "thumbnail": False})
     assert o["format_sort"] == ["res:720", "vcodec:h264", "acodec:aac"], "format: 720p mp4 prefers h264 at 720"
     assert o.get("writesubtitles") and "writethumbnail" not in o \
         and any(p["key"] == "FFmpegEmbedSubtitle" for p in pps), "format: subtitles embedded, no thumbnail"
@@ -137,12 +137,12 @@ ERROR_CASES = [
 @pytest.mark.parametrize("exc,want", ERROR_CASES,
                          ids=[f"error type -> {w:9} ({type(e).__name__}: {str(e)[:30]})" for e, w in ERROR_CASES])
 def test_error_kind_by_type(exc, want):
-    assert M._error_kind(exc) == want
+    assert errors._error_kind(exc) == want
 
 
 def test_unavailable_titles():
-    assert all(M.UNAVAILABLE_TITLE.match(t) for t in ("[Private video]", "[Deleted video]")) \
-        and not M.UNAVAILABLE_TITLE.match("[MV] Song"), "unavailable titles"
+    assert all(extract.UNAVAILABLE_TITLE.match(t) for t in ("[Private video]", "[Deleted video]")) \
+        and not extract.UNAVAILABLE_TITLE.match("[MV] Song"), "unavailable titles"
 
 
 def test_incremental_saves(mgr, merged, monkeypatch):
@@ -155,7 +155,7 @@ def test_incremental_saves(mgr, merged, monkeypatch):
     mgr.save_state()
     monkeypatch.undo()
     assert written == {"jobs": 1, "items": 1}, f"save: only the changed video is written: {written}"
-    reloaded = M.Store(M.DB_FILE, M.DB_BACKUP).load()
+    reloaded = store.Store(config.DB_FILE, config.DB_BACKUP).load()
     assert any(it["title"] == "Renamed B" for j in reloaded for it in j["items"]), "save: change is in the database"
 
 
@@ -168,9 +168,9 @@ def test_item_log(mgr, merged):
     rev_before = items["C"]["rev"]
     mgr._item_log(job, items["C"], "warning", "another line")
     assert items["C"]["rev"] > rev_before, "log: a new line marks the video as changed (so it is saved)"
-    for h in M.log.handlers:
+    for h in config.log.handlers:
         h.flush()
-    assert "test failure" in M.LOG_FILE.read_text(), "log: written to app.log"
+    assert "test failure" in config.LOG_FILE.read_text(), "log: written to app.log"
 
 
 def test_migrate_legacy_state(merged, tmp, make_manager):
@@ -181,7 +181,7 @@ def test_migrate_legacy_state(merged, tmp, make_manager):
     (legacy / "state.json").write_text(json.dumps([old_job]))
     m2 = make_manager(legacy)
     assert "oldjob" in m2.jobs and len(m2.jobs["oldjob"]["items"]) == len(job["items"]), "migrate: old library loaded"
-    assert any(j["id"] == "oldjob" for j in M.Store(M.DB_FILE, M.DB_BACKUP).load()), "migrate: written to library.db"
+    assert any(j["id"] == "oldjob" for j in store.Store(config.DB_FILE, config.DB_BACKUP).load()), "migrate: written to library.db"
     assert (legacy / "state.json.migrated").exists() and not (legacy / "state.json").exists(), \
         "migrate: state.json kept as .migrated"
 
@@ -190,7 +190,7 @@ def test_library_stays_in_repo_data():
     """Without YTDL_DATA_DIR the library is <repo>/data, wherever the code lives (importing creates nothing)."""
     env = {k: v for k, v in os.environ.items() if k != "YTDL_DATA_DIR"}
     out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, 'backend'); "
-                          "from ytdl import manager; print(manager.DATA_DIR)"],
+                          "from ytdl import config; print(config.DATA_DIR)"],
                          cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr[-500:]
     assert Path(out.stdout.strip()) == ROOT / "data"

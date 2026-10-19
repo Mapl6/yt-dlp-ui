@@ -11,6 +11,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from yt_dlp.utils import DownloadError
 
+from ytdl import extract, files, ytdlp
 from ytdl import manager as M
 from ytdl import server
 from helpers import ROOT, items_of, make_job, wait
@@ -67,7 +68,7 @@ def fake_inspect(monkeypatch):
                 "items": [{"index": 1, "id": vid, "title": f"Single {vid}", "url": url, "duration": 30,
                            "extractor": "Test"}]}
 
-    monkeypatch.setattr(M, "inspect_url", inspect)
+    monkeypatch.setattr(extract, "inspect_url", inspect)
 
 
 def api_routes():
@@ -313,7 +314,7 @@ def test_open_routes(api, mgr, fake_inspect):
 
 def test_ytdlp_routes(api, mgr, monkeypatch):
     r = api.get("/api/ytdlp").json()
-    assert r["version"] == M.yt_dlp.version.__version__ and r["can_restart"] is False
+    assert r["version"] == ytdlp.yt_dlp.version.__version__ and r["can_restart"] is False
     monkeypatch.setattr(mgr, "_update_cmd", lambda: [sys.executable, "-c", "print('updated')"], raising=False)
     monkeypatch.setattr(mgr, "_installed_ytdlp", lambda: "2099.01.01", raising=False)
     assert api.post("/api/ytdlp/update").status_code == 200
@@ -378,9 +379,9 @@ def test_refresh_route(api, mgr, job, monkeypatch):
                 "items": [{"index": i + 1, "id": v, "title": f"Video {v}", "url": f"test://{v}", "duration": 30,
                            "extractor": "Test"} for i, v in enumerate(["v1", "v2", "v3", "v4"])]}
 
-    monkeypatch.setattr(M, "inspect_url", inspect)
+    monkeypatch.setattr(extract, "inspect_url", inspect)
     assert api.post(f"/api/jobs/{job['id']}/refresh").json() == {"added": 1}
-    monkeypatch.setattr(M, "inspect_url", lambda url, s: (_ for _ in ()).throw(DownloadError("ERROR: offline")))
+    monkeypatch.setattr(extract, "inspect_url", lambda url, s: (_ for _ in ()).throw(DownloadError("ERROR: offline")))
     r = api.post(f"/api/jobs/{job['id']}/refresh")
     assert r.status_code == 400 and r.json()["detail"] == "offline"
 
@@ -425,7 +426,7 @@ def test_job_actions(api, mgr, out, monkeypatch):
     assert api.post(f"/api/jobs/{jid}/pause").json() == {"ok": True} and j["paused"]
     assert api.post(f"/api/jobs/{jid}/resume").json() == {"ok": True} and not j["paused"]
     opened = []
-    monkeypatch.setattr(M, "_open_path", lambda path, reveal=False: opened.append(path))
+    monkeypatch.setattr(files, "_open_path", lambda path, reveal=False: opened.append(path))
     assert api.post(f"/api/jobs/{jid}/open").status_code == 200 and opened == [str(out)]
     r = api.post(f"/api/jobs/{jid}/explode")
     assert r.status_code == 400 and "Unknown action" in r.json()["detail"]

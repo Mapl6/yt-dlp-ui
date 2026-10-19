@@ -124,7 +124,7 @@ def make_status_item():
             server.manager.pause_all(False)
 
         def openFolder_(self, sender):
-            from ytdl.manager import _folder_problem, _open_folder
+            from ytdl.files import _folder_problem, _open_folder
             import os
             folder = os.path.expanduser(server.manager.settings["output_dir"])
             if not _folder_problem(folder):
@@ -210,7 +210,7 @@ def main():
     state["window"] = window
     window.events.closing += on_closing
     # Not private: pywebview's default forgets the page's storage (remembered tabs, filters) on every start.
-    from ytdl.manager import DATA_DIR
+    from ytdl.config import DATA_DIR
     webview.start(on_started, (args.smoke,), private_mode=False, storage_path=str(DATA_DIR / "webview"))
 
     # the window is gone: stop the web server and save the library

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import copy
-import errno
 import json
 import logging
 import os
 import re
 import shutil
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -19,1180 +16,83 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-try:
-    import fcntl                                   # POSIX file locks (macOS / Linux)
-except ImportError:
-    fcntl = None
-try:
-    import msvcrt                                  # Windows file locks
-except ImportError:
-    msvcrt = None
-
 import yt_dlp
-from yt_dlp import cookies as ytdlp_cookies
-from yt_dlp.cookies import CookieLoadError
-from yt_dlp.networking.exceptions import HTTPError, TransportError
-from yt_dlp.postprocessor.common import PostProcessor
-from yt_dlp.postprocessor.sponsorblock import SponsorBlockPP
-from yt_dlp.utils import ContentTooShortError, DownloadCancelled, ExtractorError, GeoRestrictedError, download_range_func
+from yt_dlp.utils import DownloadCancelled, download_range_func
 
-ROOT = Path(__file__).resolve().parents[2]               # the repo: backend/ytdl/ -> ../..
-DATA_DIR = Path(os.environ.get("YTDL_DATA_DIR") or ROOT / "data")   # the library stays in <repo>/data
-DB_FILE = DATA_DIR / "library.db"
-DB_BACKUP = DATA_DIR / "library.backup.db"
-LEGACY_STATE = DATA_DIR / "state.json"            # pre-SQLite library, migrated on first start
-LEGACY_BACKUP = DATA_DIR / "state.backup.json"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-LOG_FILE = DATA_DIR / "app.log"
-ARCHIVE_NAME = ".downloaded.txt"
-LOCK_DIR_NAME = ".ytdl-locks"                     # per-video locks inside the download folder
-
-MAX_WORKERS = 8          # hard upper bound for parallel downloads
-MAX_ATTEMPTS = 4         # per item, for unexpected errors
-MAX_NET_ATTEMPTS = 40    # per item, for connection problems (weak internet must never lose a video)
-MAX_RATE_STRIKES = 8     # per item: a video fails only if other downloads work while it alone is blocked
-RATE_BLOCK_STRIKES = 3   # waves of rate limiting before the banner says to change cookies or VPN
-COOKIE_HOLD = 3600       # a cookie error pauses the queue until the settings change (or this runs out)
-MIN_FREE_BYTES = 1 << 30 # pause everything below 1 GB free
-BACKUP_EVERY = 600       # seconds between copies of the library to library.backup.db
-ITEM_LOG_LINES = 40      # warnings/errors kept per video for the "Details" view
-ACTIVE = {"downloading", "processing"}
-
-DEFAULT_SETTINGS = {
-    "output_dir": str(Path.home() / "Downloads" / "YT Downloader"),
-    "concurrency": 3,
-    "cookies_browser": "",       # "", chrome, safari, firefox, brave, edge, arc, chrome-canary ...
-    "cookies_profile": "",       # browser profile folder ("Default", "Profile 1", a Firefox profile path); "" = newest
-    "rate_limit_mb": 0.0,        # per download, 0 = unlimited
-    "sleep_between": 0.0,        # seconds between starting downloads (helps avoid 429s)
-    "proxy": "",                 # e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080
-    "wait_for_network": True,    # hold the queue while offline, slow down on a weak connection
-    "total_rate_mb": 0.0,        # shared by all downloads, 0 = unlimited
-    "schedule_on": False,        # only start downloads between schedule_start and schedule_end (local time)
-    "schedule_start": "01:00",
-    "schedule_end": "07:00",
-    "sub_langs": "en",           # default subtitle languages, e.g. "en, fa"
-    "notify": False,             # desktop notifications (finished playlist, failed video)
-}
-HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
-
-VIDEO_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
-AUDIO_FORMATS = {"mp3", "m4a", "opus"}
-# Typical total bitrate (bits/s) per quality, to estimate sizes before they are known.
-BITRATES = {2160: 20e6, 1440: 10e6, 1080: 5e6, 720: 2.5e6, 480: 1.2e6, 360: 0.7e6, 240: 0.4e6, 144: 0.2e6}
-BEST_BITRATE, AUDIO_BITRATE = 8e6, 160e3
-SPONSOR_CATEGORIES = ("sponsor", "selfpromo", "interaction")
-SUB_LANG = re.compile(r"^(?:all|[a-z]{2,3}(?:-[a-z0-9]+)*)$", re.I)
-SYNC_TICK = 60           # seconds between checks for playlists due an automatic refresh
-SYNC_CHOICES = (0, 6, 12, 24, 168)                # hours between automatic refreshes (0 = off)
-YTDLP_CHECK_EVERY = 6 * 3600
-
-# Text fallbacks for error classification (exception types and HTTP status are checked first).
-DISK_ERRORS = re.compile(r"no space left|errno 28|disk (?:is )?full|not enough space", re.I)
-PERMANENT_ERRORS = re.compile(
-    r"private video|video unavailable|has been removed|members.only|not available in your country|"
-    r"copyright|account associated with this video|sign in to confirm your age|premieres in|"
-    r"this live event will begin|deleted video|is not a valid url|unsupported url|http error 404",
-    re.I,
+from . import config, extract, files, verify
+from .config import (
+    ACTIVE,
+    ARCHIVE_NAME,
+    BACKUP_EVERY,
+    CHECK_WORKERS,
+    COOKIE_HOLD,
+    ITEM_LOG_LINES,
+    LOCK_DIR_NAME,
+    MAX_ATTEMPTS,
+    MAX_NET_ATTEMPTS,
+    MAX_RATE_STRIKES,
+    MAX_WORKERS,
+    MIN_FREE_BYTES,
+    RATE_BLOCK_STRIKES,
+    SYNC_CHOICES,
+    SYNC_TICK,
+    YTDLP_CHECK_EVERY,
+    _queue_state_file,
+    log,
+    setup_logging,
 )
-RATE_LIMIT_ERRORS = re.compile(r"http error 429|too many requests|confirm you.?re not a bot|rate.?limit", re.I)
-COOKIE_ERRORS = re.compile(
-    r"could not find [\w -]+ cookies database|cookies database not found|failed to (?:load|decrypt) cookies|"
-    r"unsupported browser(?: specified for cookies)?:|cookies?\b.*operation not permitted",
-    re.I,
+from .cookies import (
+    MAX_COOKIE_FILE,
+    _cookie_error_text,
+    _cookie_file,
+    _cookie_summary,
+    _parse_cookie_text,
+    cookie_file_status,
 )
-NETWORK_ERRORS = re.compile(
-    r"timed? ?out|connection (?:reset|refused|aborted|error|broken)|remote end closed|broken pipe|"
-    r"network is unreachable|no route to host|temporary failure in name resolution|name or service not known|"
-    r"nodename nor servname|getaddrinfo|failed to resolve|unable to connect|proxy|ssl|eof occurred|"
-    r"incomplete ?read|content too short|did not get any data|http error 5\d\d|transport|urlopen error|"
-    r"unable to download (?:webpage|video data|json|api)|giving up after|errno (?:32|54|60|61|65|104|110|111|113)",
-    re.I,
+from .errors import AlreadyRunning, _clean_error, _error_kind, _IncompleteFile
+from .extract import UNAVAILABLE_TITLE
+from .files import (
+    FINAL_FILE,
+    ID_TAG,
+    IMAGE_EXT,
+    LEFTOVER,
+    SIDECAR,
+    _disk_free,
+    _FileLock,
+    _files_for,
+    _folder_problem,
+    _lock_path,
+    _move_aside,
+    _open_folder,
+    _part_files,
+    _remove,
 )
-# Files in a download folder, recognised by the "[video id]" yt-dlp puts in every name.
-MEDIA_EXTS = ("mp4", "mkv", "webm", "mp3", "m4a", "opus", "ogg", "flac", "wav", "mov")
-FINAL_FILE = re.compile(r"\[([^\[\]]+)\]\.(?:%s)$" % "|".join(MEDIA_EXTS), re.I)   # "Title [id].mp4"
-ID_TAG = re.compile(r"\[([^\[\]]+)\]")
-LEFTOVER = re.compile(r"\.(?:part|ytdl|damaged)$|\.part-Frag\d+|\.temp\.\w+$", re.I)
-SIDECAR = re.compile(r"\.(?:jpe?g|webp|png|vtt|srt|ass|lrc)$", re.I)
-IMAGE_EXT = re.compile(r"\.(?:jpe?g|webp|png)$", re.I)
-CHECK_WORKERS = 3        # files verified in parallel by "Check files"
-
-# Placeholder titles YouTube uses for entries that can't be watched any more.
-UNAVAILABLE_TITLE = re.compile(r"^\[(?:private|deleted|unavailable)[^\]]*\]$", re.I)
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-log = logging.getLogger("ytdl")
-
-
-def setup_logging():
-    if log.handlers:
-        return
-    DATA_DIR.mkdir(exist_ok=True)
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
-    log.addHandler(handler)
-    log.setLevel(logging.INFO)
-    log.propagate = False
-
-
-def _clean_error(exc: Exception) -> str:
-    msg = ANSI.sub("", str(exc)).strip()
-    msg = re.sub(r"^ERROR:\s*", "", msg)
-    msg = re.sub(r"^\[[^\]]+\]\s*[\w-]+:\s*", "", msg)  # drop "[youtube] abc123: " prefix
-    return msg[:400]
-
-
-def _exc_chain(exc: BaseException) -> list[BaseException]:
-    """The exception plus everything it wraps (yt-dlp keeps the original in exc_info / cause)."""
-    seen: dict[int, BaseException] = {}
-    stack = [exc]
-    while stack:
-        e = stack.pop()
-        if not isinstance(e, BaseException) or id(e) in seen:
-            continue
-        seen[id(e)] = e
-        info = getattr(e, "exc_info", None)
-        if isinstance(info, tuple) and len(info) > 1:
-            stack.append(info[1])
-        stack += [getattr(e, "cause", None), e.__cause__, e.__context__]
-    return list(seen.values())
-
-
-def _error_kind(exc: BaseException | str) -> str:
-    """disk | cookies | permanent | ratelimit | network | other"""
-    chain = [] if isinstance(exc, str) else _exc_chain(exc)
-    if any(isinstance(e, CookieLoadError) for e in chain):
-        return "cookies"                             # the browser's cookies couldn't be read: no retry fixes it
-    for e in chain:
-        if isinstance(e, OSError) and e.errno == errno.ENOSPC:
-            return "disk"
-        if isinstance(e, HTTPError):
-            if e.status == 429:
-                return "ratelimit"
-            if e.status in (404, 410):
-                return "permanent"
-            if e.status >= 500 or e.status in (403, 408):   # 403: expired stream URL, fixed by re-extracting
-                return "network"
-        if isinstance(e, GeoRestrictedError):
-            return "permanent"
-    msg = exc if isinstance(exc, str) else " | ".join(_clean_error(e) for e in chain)
-    for kind, rx in (("disk", DISK_ERRORS), ("cookies", COOKIE_ERRORS), ("ratelimit", RATE_LIMIT_ERRORS),
-                     ("permanent", PERMANENT_ERRORS)):
-        if rx.search(msg):
-            return kind
-    if any(isinstance(e, (TransportError, ContentTooShortError, socket.timeout, TimeoutError, ConnectionError))
-           for e in chain) or NETWORK_ERRORS.search(msg):
-        return "network"
-    if any(isinstance(e, ExtractorError) and e.expected for e in chain):
-        return "permanent"                           # yt-dlp marks errors a retry can't fix as "expected"
-    return "other"
-
-
-class _IncompleteFile(Exception):
-    """The download finished but the file on disk failed verification."""
-
-
-def _escape_tmpl(text: str) -> str:
-    """Make literal text safe inside a yt-dlp output template."""
-    return text.replace("%", "%%")
-
-
-def _safe_name(text: str) -> str:
-    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text).strip(" .")
-    return text[:120] or "Untitled"
-
-
-def _queue_state_file() -> Path:
-    return DATA_DIR / "queue_state.json"          # the queue-wide pause, kept across restarts
-
-
-def _fmt_secs(s: float) -> str:
-    s = int(s)
-    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
-
-
-def _atomic_write(path: Path, text: str):
-    """Write so that a crash or power loss leaves either the old file or the new one, never half of each."""
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-def _coerce_settings(raw: dict) -> dict:
-    """Return complete, well-typed settings; bad values fall back to the defaults."""
-    out = {}
-    for key, default in DEFAULT_SETTINGS.items():
-        value = raw.get(key, default)
-        try:
-            if isinstance(default, bool):
-                value = value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes", "on")
-            elif isinstance(default, int):
-                value = int(float(value))
-            elif isinstance(default, float):
-                value = max(0.0, float(value))
-            else:
-                value = str(value or "").strip()
-        except (TypeError, ValueError):
-            value = default
-        out[key] = value
-    out["concurrency"] = max(1, min(MAX_WORKERS, out["concurrency"]))
-    out["output_dir"] = out["output_dir"] or DEFAULT_SETTINGS["output_dir"]
-    for key in ("schedule_start", "schedule_end"):
-        m = HHMM.match(out[key])
-        out[key] = f"{int(m.group(1)):02d}:{m.group(2)}" if m else DEFAULT_SETTINGS[key]
-    return out
-
-
-def _minutes(hhmm: str) -> int:
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
-
-
-def _sub_langs(text: str) -> list[str]:
-    """ "en, fa" -> yt-dlp patterns that also match regional variants (en-US, en-GB…)."""
-    out = []
-    for code in re.split(r"[\s,;]+", text or ""):
-        if SUB_LANG.match(code):
-            out += ["all"] if code.lower() == "all" else [code, f"{code}-.*"]
-    return out or ["en", "en-.*"]
-
-
-def _parse_time(text) -> float | None:
-    """ "90", "1:30", "1:02:03" or "1:30.5" -> seconds (None if it can't be read)."""
-    text = str(text).strip()
-    if not re.fullmatch(r"\d+(?::\d{1,2}){0,2}(?:\.\d+)?", text):
-        return None
-    secs = 0.0
-    for part in text.split(":"):
-        secs = secs * 60 + float(part)
-    return secs
-
-
-def _parse_section(section) -> dict | None:
-    """Validate "download only part": {"start": "1:00", "end": "2:30"} -> {"start": 60.0, "end": 150.0}.
-    An empty end means "to the end of the video". None when no part is asked for."""
-    if not section:
-        return None
-    start_txt, end_txt = str(section.get("start") or "").strip(), str(section.get("end") or "").strip()
-    if not start_txt and not end_txt:
-        return None
-    start = _parse_time(start_txt) if start_txt else 0.0
-    end = _parse_time(end_txt) if end_txt else None
-    if start is None or (end_txt and end is None):
-        raise ValueError("Use times like 1:30, 1:02:03 or 90 for the part to download")
-    if end is not None and end <= start:
-        raise ValueError("The end of the part must be after its start")
-    return {"start": start, "end": end}
-
-
-def _section_label(section: dict) -> str:
-    """For the file name: "1-00–2-30" (no colons, which some systems don't allow)."""
-    end = _fmt_secs(section["end"]) if section.get("end") is not None else "end"
-    return f"{_fmt_secs(section['start'])}–{end}".replace(":", "-")
-
-
-def _expected_duration(item: dict) -> float | None:
-    """Length the finished file should have: as verified at download (parts and cut sponsor segments make
-    it shorter than the video), else the part asked for, else the video's length."""
-    if item.get("media_duration"):
-        return item["media_duration"]
-    section = (item.get("options") or {}).get("section")
-    if section:
-        end = section.get("end") if section.get("end") is not None else item.get("duration")
-        return end - section["start"] if end else None
-    if (item.get("options") or {}).get("sponsorblock") == "remove":
-        return None                                  # length after cutting isn't known
-    return item.get("duration")
-
-
-def _estimate_bytes(item: dict, options: dict) -> tuple[int, bool]:
-    """-> (bytes still to download, exact?). Uses the size yt-dlp reported, else duration × typical bitrate."""
-    if item.get("total") and item["status"] in ("queued", "downloading"):
-        return max(0, int(item["total"]) - int(item.get("downloaded") or 0)), True
-    quality = str(options.get("quality", "best"))
-    bps = AUDIO_BITRATE if quality in AUDIO_FORMATS else BITRATES.get(int(quality), BEST_BITRATE) \
-        if quality.isdigit() else BEST_BITRATE
-    duration = item.get("duration")
-    section = options.get("section")
-    if duration and section:
-        duration = (section["end"] if section.get("end") is not None else duration) - section["start"]
-    return (int(max(0, duration) * bps / 8) if duration else 0), False
-
-
-def _disk_free(path: str) -> dict:
-    """Free space where path is (or would be). Never creates folders; an unplugged drive is reported."""
-    parts = Path(path).parts
-    if sys.platform == "darwin" and len(parts) > 2 and parts[1] == "Volumes" and not Path("/Volumes", parts[2]).is_dir():
-        return {"free": None, "problem": f"Drive “{parts[2]}” is not connected"}
-    p = Path(os.path.expanduser(path))
-    while not p.exists() and p != p.parent:
-        p = p.parent
-    try:
-        du = shutil.disk_usage(p)
-        return {"free": du.free, "total": du.total, "dev": os.stat(p).st_dev, "path": str(p)}
-    except OSError as exc:
-        return {"free": None, "problem": str(exc.strerror or exc)}
-
-
-def _retry_sleep(n: int) -> float:
-    return min(2 ** n, 30)          # 1, 2, 4, … capped at 30 s between yt-dlp's own retries
-
-
-def _folder_problem(outdir: str) -> str | None:
-    """Why we can't write to outdir right now (None when it's fine)."""
-    parts = Path(outdir).parts
-    # An unplugged external drive: never recreate /Volumes/<name> on the system disk.
-    if sys.platform == "darwin" and len(parts) > 2 and parts[1] == "Volumes" and not Path("/Volumes", parts[2]).is_dir():
-        return f"Drive “{parts[2]}” is not connected — waiting for it"
-    try:
-        Path(outdir).mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return f"Can't write to the folder: {exc.strerror or exc}"
-    if not os.access(outdir, os.W_OK):
-        return "No permission to write to the folder"
-    return None
-
-
-DAMAGED = "The downloaded file is damaged"
-
-
-def _decodes_fully(path: str, duration: float | None) -> bool:
-    """Second opinion before calling a file damaged: decode all of it. True only if ffmpeg reads it to the
-    end without a single error (and, when the length is known, reaches at least 97% of it)."""
-    if not shutil.which("ffmpeg"):
-        return False
-    try:
-        res = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:V?", "-map", "0:a?",
-                              "-f", "null", "-", "-progress", "pipe:1", "-nostats"],
-                             capture_output=True, text=True, timeout=min(3600, max(300, 2 * (duration or 600))))
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if res.returncode != 0 or res.stderr.strip():
-        return False
-    times = re.findall(r"out_time_us=(\d+)", res.stdout)
-    reached = int(times[-1]) / 1e6 if times else 0.0
-    return reached >= 0.97 * duration if duration else reached > 0
-
-
-def _verify_file(path: str | None, duration: float | None) -> str | None:
-    """Check the finished file is really there and complete. Returns a problem, or None."""
-    if not path or not os.path.isfile(path):
-        return "The downloaded file is missing"
-    if os.path.getsize(path) == 0:
-        return "The downloaded file is empty"
-    if not shutil.which("ffprobe"):
-        return None
-    try:
-        res = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                              "-of", "default=nw=1:nk=1", path], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if res.returncode != 0:
-        return DAMAGED
-    try:
-        real = float(res.stdout.split()[0])
-    except (ValueError, IndexError):
-        return None                                  # no duration in the container: nothing to compare
-    if duration and real < duration - max(10, 0.03 * duration):
-        return f"The file is incomplete ({_fmt_secs(real)} of {_fmt_secs(duration)})"
-    # The header can claim the full length of a cut-off file: decode the last seconds to be sure they exist.
-    if real > 15:
-        try:
-            tail = subprocess.run(["ffmpeg", "-v", "error", "-sseof", "-5", "-i", path, "-map", "0:a:0?",
-                                   "-map", "0:V:0?", "-f", "framemd5", "-"], capture_output=True, text=True, timeout=120)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if tail.returncode == 0 and not any(line and not line.startswith("#") for line in tail.stdout.splitlines()):
-            return "The end of the file is missing"
-    return None
-
-
-def _has_cover(path: str) -> bool:
-    """True if the file carries an embedded cover picture (so the separate thumbnail file isn't needed)."""
-    try:
-        res = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
-                              "stream=codec_name:stream_disposition=attached_pic", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return any(line.rstrip().endswith(",1") for line in res.stdout.splitlines())
-
-
-class _PlaylistTags(PostProcessor):
-    """Adds the playlist name (album) and the video's number (track) to the file's metadata."""
-
-    def __init__(self, tags: dict):
-        super().__init__()
-        self.tags = {f"meta_{k}": v for k, v in tags.items() if v}
-
-    def run(self, info):
-        info.update(self.tags)
-        return [], info
-
-
-def _describe_format(info: dict) -> str:
-    """ "1920x1080 · avc1 + mp4a · mp4" for the formats yt-dlp picked."""
-    fmts = info.get("requested_formats") or [info]
-    res = next((f.get("resolution") for f in fmts if f.get("height")), None) or info.get("resolution")
-    codecs = [next((f.get(k) for f in fmts if f.get(k) not in (None, "none")), None) for k in ("vcodec", "acodec")]
-    bits = [res if res and res != "audio only" else None,
-            " + ".join(c.split(".")[0] for c in codecs if c), info.get("ext")]
-    return " · ".join(b for b in bits if b)
-
-
-class _FormatNote(PostProcessor):
-    """Runs after format selection, before the download: reports which format was chosen."""
-
-    def __init__(self, report):
-        super().__init__()
-        self.report = report
-
-    def run(self, info):
-        try:
-            self.report(_describe_format(info))
-        except Exception:                          # a display detail must never break a download
-            pass
-        return [], info
-
-
-class _SafeSponsorBlock(SponsorBlockPP):
-    """SponsorBlock that never fails a download: if the segment list can't be fetched, download without it."""
-
-    def run(self, info):
-        try:
-            return super().run(info)
-        except Exception as exc:
-            self.report_warning(f"SponsorBlock segments unavailable ({_clean_error(exc)}); continuing without them")
-            return [], info
-
-
-class _FileLock:
-    """An exclusive, non-blocking OS lock. Released automatically if the process dies."""
-
-    def __init__(self, path: Path):
-        self.path, self.fd = path, None
-
-    def acquire(self) -> bool:
-        if fcntl is None and msvcrt is None:
-            return True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            if fcntl:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)      # locks the first byte (may lie past the end)
-        except OSError:
-            os.close(fd)
-            return False
-        os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode())
-        self.fd = fd
-        return True
-
-    def release(self):
-        if self.fd is None:
-            return
-        try:
-            self.path.unlink(missing_ok=True)       # POSIX: remove while still locked; Windows can't, see below
-        except OSError:
-            pass
-        if fcntl:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-        else:
-            try:
-                os.lseek(self.fd, 0, os.SEEK_SET)
-                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-        os.close(self.fd)
-        self.fd = None
-        if not fcntl:
-            try:
-                self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-class AlreadyRunning(RuntimeError):
-    pass
-
-
-def _files_for(outdir: str, vid: str) -> list[Path]:
-    """Every file in outdir that belongs to this video id."""
-    tag = f"[{vid}]"
-    try:
-        return [p for p in Path(outdir).iterdir() if tag in p.name and p.is_file()]
-    except OSError:
-        return []
-
-
-def _part_files(outdir: str, vid: str) -> dict[str, Path]:
-    """Finished separate streams waiting to be merged ("Title [id].f137.mp4"), by format id."""
-    rx = re.compile(re.escape(f"[{vid}]") + r"\.f([\w-]+)\.\w+$")
-    out = {}
-    for p in _files_for(outdir, vid):
-        m = rx.search(p.name)
-        if m and not LEFTOVER.search(p.name):
-            out[m.group(1)] = p
-    return out
-
-
-def _check_part_sizes(info: dict, parts: dict[str, Path]) -> str | None:
-    """Each downloaded stream must be exactly the size the site reported (catches cut-off or doubled data).
-    Only plain http(s) streams are compared; fragmented ones (HLS/DASH) have no exact size in advance."""
-    expected = {f.get("format_id"): f.get("filesize") for f in info.get("requested_formats") or []
-                if str(f.get("protocol") or "").startswith("http")}
-    for fid, path in parts.items():
-        size, want = path.stat().st_size, expected.get(fid)
-        if want and size != want:
-            return f"Downloaded stream {fid} has the wrong size ({size:,} instead of {want:,} bytes)"
-    return None
-
-
-def _lock_path(outdir: str, archive_key: str) -> Path:
-    return Path(outdir) / LOCK_DIR_NAME / (re.sub(r"[^\w.-]", "_", archive_key) + ".lock")
-
-
-def _move_aside(path: str) -> str:
-    """Rename a damaged file instead of deleting it: "x.mp4" -> "x.mp4.damaged"."""
-    target = path + ".damaged"
-    if os.path.exists(target):
-        target = f"{path}.{int(time.time())}.damaged"
-    os.replace(path, target)
-    return target
-
-
-def _remove(paths):
-    for p in paths:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-
-class _QuietLogger:
-    def debug(self, msg): pass
-    def info(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): pass
-
-
-class _ItemLogger(_QuietLogger):
-    """Keeps yt-dlp's warnings and errors for one video (shown under "Details") and writes them to app.log."""
-
-    LEVEL = re.compile(r"^(?:\x1b\[[0-9;]*m)*(?:ERROR|WARNING):(?:\x1b\[[0-9;]*m)*\s*")
-
-    def __init__(self, add):
-        self._add = add
-
-    def warning(self, msg):
-        self._add("warning", self.LEVEL.sub("", str(msg)))   # the log line has its own level: no "ERROR: ERROR:"
-
-    def error(self, msg):
-        self._add("error", self.LEVEL.sub("", str(msg)))
-
-
-def _base_opts(settings: dict, logger=None) -> dict:
-    opts = {
-        "quiet": True,
-        "no_warnings": False,
-        "noprogress": True,
-        "logger": logger or _QuietLogger(),
-        "js_runtimes": {"deno": {}, "node": {}, "bun": {}},
-        "socket_timeout": 30,        # a stalled connection is dropped and retried after 30 s
-        "retries": 15,
-        "extractor_retries": 5,
-        "retry_sleep_functions": {"http": _retry_sleep, "fragment": _retry_sleep,
-                                  "extractor": _retry_sleep, "file_access": lambda n: 1},
-    }
-    if settings.get("proxy"):
-        opts["proxy"] = settings["proxy"].strip()
-    if settings.get("cookies_browser"):
-        opts["cookiesfrombrowser"] = (settings["cookies_browser"], settings.get("cookies_profile") or None)
-    return opts
-
-
-# ---------------------------------------------------------------- browser cookies
-
-# Chromium browsers yt-dlp doesn't know by name: (folder under Application Support, keychain name).
-EXTRA_BROWSERS = {"arc": ("Arc/User Data", "Arc"), "chrome-canary": ("Google/Chrome Canary", "Chrome")} \
-    if sys.platform == "darwin" else {}
-BROWSER_NAMES = {"chrome": "Google Chrome", "chrome-canary": "Chrome Canary", "arc": "Arc", "brave": "Brave",
-                 "edge": "Microsoft Edge", "chromium": "Chromium", "opera": "Opera", "vivaldi": "Vivaldi",
-                 "whale": "Naver Whale", "firefox": "Firefox", "safari": "Safari"}
-LOGIN_COOKIES = {"SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "LOGIN_INFO"}
-FULL_DISK_HINT = ("macOS blocks access to it: open System Settings → Privacy & Security → Full Disk Access and "
-                  "turn it on for the app that runs YT Downloader (Terminal, or YT Downloader), then try again")
-
-
-def _register_extra_browsers():
-    """Teach yt-dlp the Chromium browsers in EXTRA_BROWSERS (it reads cookies from them like from Chrome)."""
-    orig = getattr(ytdlp_cookies, "_get_chromium_based_browser_settings", None)
-    if not EXTRA_BROWSERS or orig is None or getattr(orig, "_extra", False):
-        return
-
-    def settings(name):
-        if name in EXTRA_BROWSERS:
-            folder, keyring = EXTRA_BROWSERS[name]
-            return {"browser_dir": os.path.expanduser(f"~/Library/Application Support/{folder}"),
-                    "keyring_name": keyring, "supports_profiles": True}
-        return orig(name)
-
-    settings._extra = True
-    ytdlp_cookies._get_chromium_based_browser_settings = settings
-    ytdlp_cookies.SUPPORTED_BROWSERS.update(EXTRA_BROWSERS)
-    ytdlp_cookies.CHROMIUM_BASED_BROWSERS.update(EXTRA_BROWSERS)
-
-
-_register_extra_browsers()
-
-
-def _browser_dir(browser: str) -> str | None:
-    try:
-        return ytdlp_cookies._get_chromium_based_browser_settings(browser)["browser_dir"]
-    except Exception:
-        return None
-
-
-def _listdir(path: str) -> list[str] | None:
-    """Folder entries; None when the folder is missing; raises PermissionError when macOS blocks it."""
-    try:
-        return sorted(os.listdir(path))
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-
-
-def _chromium_profiles(root: str) -> list[dict]:
-    names = {}
-    try:                                           # the names people gave their profiles ("Work", "Mahdi")
-        cache = json.loads((Path(root) / "Local State").read_text(encoding="utf-8"))["profile"]["info_cache"]
-        names = {k: (v.get("name") or k) for k, v in cache.items()}
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    out = []
-    for entry in _listdir(root) or []:
-        base = Path(root) / entry
-        if (base / "Cookies").is_file() or (base / "Network" / "Cookies").is_file():
-            out.append({"id": entry, "name": names.get(entry, entry)})
-    if not out and ((Path(root) / "Cookies").is_file() or (Path(root) / "Network" / "Cookies").is_file()):
-        out.append({"id": "", "name": "Default"})   # browsers without profiles (Opera)
-    return out
-
-
-def cookie_sources() -> list[dict]:
-    """Browsers found on this computer that cookies can be read from, with their profiles.
-    status: ok | no-profiles (installed, but no profile with cookies) | blocked (macOS needs Full Disk Access)."""
-    found = []
-
-    def add(browser, profiles=None, status="ok", note=""):
-        found.append({"browser": browser, "name": BROWSER_NAMES.get(browser, browser.title()),
-                      "profiles": profiles or [], "status": status, "note": note})
-
-    chromium = sorted(ytdlp_cookies.CHROMIUM_BASED_BROWSERS, key=lambda b: list(BROWSER_NAMES).index(b)
-                      if b in BROWSER_NAMES else 99)
-    for browser in chromium:
-        root = _browser_dir(browser)
-        if not root:
-            continue
-        try:
-            if _listdir(root) is None:
-                continue
-            profiles = _chromium_profiles(root)
-        except PermissionError:
-            add(browser, status="blocked", note=FULL_DISK_HINT)
-            continue
-        add(browser, profiles, "ok" if profiles else "no-profiles",
-            "" if profiles else f"No profile with cookies in “{root}” — sign in to YouTube in this browser first, "
-                                "or the browser keeps its data somewhere else")
-    try:
-        roots = list(ytdlp_cookies._firefox_browser_dirs())
-    except Exception:
-        roots = []
-    ff, ff_blocked = [], False
-    for root in roots:
-        try:
-            for entry in _listdir(root) or []:
-                if (Path(root) / entry / "cookies.sqlite").is_file():
-                    ff.append({"id": str(Path(root) / entry), "name": entry.split(".", 1)[-1]})
-        except PermissionError:
-            ff_blocked = True
-    if ff:
-        add("firefox", ff)
-    elif ff_blocked:
-        add("firefox", status="blocked", note=FULL_DISK_HINT)
-    if sys.platform == "darwin":
-        for path in ("~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
-                     "~/Library/Cookies/Cookies.binarycookies"):
-            path = os.path.expanduser(path)
-            try:
-                with open(path, "rb") as f:
-                    f.read(4)
-                add("safari")
-                break
-            except FileNotFoundError:
-                continue
-            except PermissionError:
-                add("safari", status="blocked", note=FULL_DISK_HINT)
-                break
-    return found
-
-
-class _CookieLog:
-    def __init__(self):
-        self.warnings: list[str] = []
-
-    def debug(self, msg): pass
-    def info(self, msg): pass
-
-    def warning(self, msg, only_once=False):
-        self.warnings.append(str(msg))
-
-    def error(self, msg):
-        self.warnings.append(str(msg))
-
-
-def _cookie_error_text(browser: str, exc: BaseException) -> str:
-    msg = ANSI.sub("", str(exc)).strip()
-    if isinstance(exc, PermissionError) or "not permitted" in msg.lower():
-        return f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {FULL_DISK_HINT}"
-    if "could not find" in msg.lower():
-        root = _browser_dir(browser)
-        if root:
-            try:
-                os.listdir(root)
-            except PermissionError:
-                return f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {FULL_DISK_HINT}"
-            except OSError:
-                pass
-        return (f"{BROWSER_NAMES.get(browser, browser)} has no cookies to read ({msg}). Choose the browser and "
-                "profile you're signed in to YouTube with, or import a cookies.txt file")
-    return (f"Couldn't read the cookies of {BROWSER_NAMES.get(browser, browser)}: {msg} — choose another browser "
-            "or profile in Settings, or import a cookies.txt file")
-
-
-def check_cookies(browser: str, profile: str = "") -> dict:
-    """Read a browser's cookies the way a download would, and say whether YouTube will see a signed-in user."""
-    if browser not in ytdlp_cookies.SUPPORTED_BROWSERS:
-        return {"ok": False, "error": f"Unknown browser “{browser}”"}
-    logger = _CookieLog()
-    try:
-        jar = ytdlp_cookies.extract_cookies_from_browser(browser, profile or None, logger)
-    except Exception as exc:
-        return {"ok": False, "error": _cookie_error_text(browser, exc)}
-    yt = [c for c in jar if c.domain.lstrip(".").endswith(("youtube.com", "google.com"))]
-    signed_in = any(c.name in LOGIN_COOKIES for c in yt)
-    failed = [w for w in logger.warnings if "decrypt" in w.lower()]
-    out = {"ok": bool(yt), "total": len(jar), "youtube": len(yt), "signed_in": signed_in}
-    if not yt:
-        out["error"] = ("Couldn't decrypt the cookies — allow access when macOS asks for the keychain password"
-                        if failed else "No YouTube cookies in this profile — open YouTube in this browser and sign in")
-    elif not signed_in:
-        out["warning"] = "Found YouTube cookies but no signed-in account; signing in helps against the bot check"
-    return out
-
-
-# ---------------------------------------------------------------- imported cookies.txt
-
-MAX_COOKIE_FILE = 2 << 20
-
-
-def _cookie_file() -> Path:
-    return DATA_DIR / "cookies.txt"
-
-
-def _parse_cookie_text(text: str) -> list[tuple[str, str]]:
-    """(domain, name) of each cookie in a Netscape cookies.txt; ValueError if it isn't one."""
-    cookies = []
-    for n, line in enumerate(text.splitlines(), 1):
-        if line.startswith("#HttpOnly_"):
-            line = line[len("#HttpOnly_"):]
-        elif not line.strip() or line.startswith("#"):
-            continue
-        parts = line.rstrip("\r").split("\t")
-        if len(parts) != 7 or parts[1].upper() not in ("TRUE", "FALSE") or parts[3].upper() not in ("TRUE", "FALSE"):
-            raise ValueError(f"Line {n} isn't in the cookies.txt (Netscape) format. Export the cookies with a "
-                             "browser extension such as “Get cookies.txt LOCALLY”.")
-        cookies.append((parts[0].lstrip("."), parts[5]))
-    return cookies
-
-
-def _cookie_summary(cookies: list[tuple[str, str]]) -> dict:
-    yt = [(d, n) for d, n in cookies if d.endswith(("youtube.com", "google.com"))]
-    return {"count": len(cookies), "youtube": len(yt), "signed_in": any(n in LOGIN_COOKIES for _, n in yt)}
-
-
-_cookie_status_cache: dict = {}
-
-
-def cookie_file_status() -> dict | None:
-    """The imported cookies.txt: when, how many cookies, whether YouTube sees a signed-in user (cached by mtime)."""
-    path = _cookie_file()
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    if _cookie_status_cache.get("key") != (str(path), mtime):
-        try:
-            summary = _cookie_summary(_parse_cookie_text(path.read_text(encoding="utf-8", errors="replace")))
-        except (OSError, ValueError):
-            summary = {"count": 0, "youtube": 0, "signed_in": False}
-        _cookie_status_cache.update(key=(str(path), mtime), value=summary | {"imported": mtime})
-    return dict(_cookie_status_cache["value"])
-
-
-@contextlib.contextmanager
-def _ytdl(opts: dict):
-    """A YoutubeDL that uses the imported cookies.txt, if there is one, instead of the browser's cookies. Each one
-    gets its own copy of the file: yt-dlp writes the cookies back when it closes, and parallel downloads would
-    otherwise overwrite each other's copy."""
-    tmp = None
-    src = _cookie_file()
-    if src.is_file() and "cookiefile" not in opts:
-        tmp = DATA_DIR / ".cookies-tmp" / f"{uuid.uuid4().hex}.txt"
-        tmp.parent.mkdir(exist_ok=True)
-        shutil.copyfile(src, tmp)
-        os.chmod(tmp, 0o600)
-        opts = {k: v for k, v in opts.items() if k != "cookiesfrombrowser"} | {"cookiefile": str(tmp)}
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            yield ydl
-    finally:
-        if tmp:
-            tmp.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------- inspection
-
-def inspect_url(url: str, settings: dict) -> dict:
-    """Return metadata for a video or (flattened) playlist without downloading anything."""
-    opts = _base_opts(settings) | {"skip_download": True, "extract_flat": "in_playlist"}
-    with _ytdl(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        info = ydl.sanitize_info(info)
-
-        if info.get("_type") in ("playlist", "multi_video"):
-            entries = list(info.get("entries") or [])
-            # Channel pages return their tabs (Videos, Shorts, Live) as nested playlists: flatten one level.
-            if entries and all(e.get("_type") == "playlist" or e.get("ie_key") == "YoutubeTab" for e in entries):
-                nested = []
-                for tab in entries:
-                    sub = ydl.sanitize_info(ydl.extract_info(tab["url"], download=False))
-                    nested.extend(sub.get("entries") or [])
-                entries = nested
-
-            seen, items = set(), []
-            for e in entries:
-                if not e or not e.get("id") or e["id"] in seen:
-                    continue
-                seen.add(e["id"])
-                items.append({
-                    "index": len(items) + 1,
-                    "id": e["id"],
-                    "title": e.get("title") or e["id"],
-                    "url": e.get("url") if str(e.get("url", "")).startswith("http")
-                           else f"https://www.youtube.com/watch?v={e['id']}",
-                    "duration": e.get("duration"),
-                    "extractor": e.get("ie_key") or info.get("extractor_key") or "youtube",
-                })
-            return {
-                "kind": "playlist",
-                "source_id": info.get("id"),
-                "title": info.get("title") or "Playlist",
-                "uploader": info.get("uploader") or info.get("channel"),
-                "thumbnail": _pick_thumb(info) or (_pick_thumb(entries[0]) if entries else None),
-                "items": items,
-                "heights": VIDEO_HEIGHTS,
-            }
-
-        heights = sorted({f["height"] for f in info.get("formats") or [] if f.get("height")}, reverse=True)
-        return {
-            "kind": "video",
-            "source_id": info.get("id"),
-            "title": info.get("title") or info.get("id"),
-            "uploader": info.get("uploader") or info.get("channel"),
-            "thumbnail": info.get("thumbnail") or _pick_thumb(info),
-            "items": [{
-                "index": 1,
-                "id": info["id"],
-                "title": info.get("title") or info["id"],
-                "url": info.get("webpage_url") or url,
-                "duration": info.get("duration"),
-                "extractor": info.get("extractor_key") or "youtube",
-            }],
-            "heights": [h for h in VIDEO_HEIGHTS if any(x >= h for x in heights)] or heights,
-        }
-
-
-def _pick_thumb(info: dict) -> str | None:
-    thumbs = info.get("thumbnails") or []
-    if thumbs:
-        best = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
-        return best.get("url")
-    return info.get("thumbnail")
-
-
-# ---------------------------------------------------------------- options
-
-def build_format_opts(options: dict) -> tuple[dict, list]:
-    """Translate UI options into yt-dlp format options and postprocessors."""
-    quality = str(options.get("quality", "best"))
-    container = options.get("container", "mp4")
-    pps: list[dict] = []
-    opts: dict = {}
-
-    if quality in AUDIO_FORMATS:
-        opts["format"] = {"m4a": "ba[ext=m4a]/ba/b", "opus": "ba[acodec=opus]/ba/b"}.get(quality, "ba/b")
-        pps.append({"key": "FFmpegExtractAudio", "preferredcodec": quality,
-                    "preferredquality": "0" if quality == "mp3" else None})
-        pps[-1] = {k: v for k, v in pps[-1].items() if v is not None}
-    else:
-        opts["format"] = "bv*+ba/b"
-        sort = [] if quality == "best" else [f"res:{int(quality)}"]
-        if container == "mp4":
-            # Prefer H.264/AAC so files play everywhere (QuickTime, phones, TVs).
-            sort += ["vcodec:h264", "acodec:aac"]
-        opts["format_sort"] = sort
-        opts["merge_output_format"] = container
-        if options.get("subtitles"):
-            opts |= {"writesubtitles": True, "subtitleslangs": _sub_langs(options.get("sub_langs") or "en"),
-                     "subtitlesformat": "srt/best"}
-            if options.get("auto_subs"):
-                opts["writeautomaticsub"] = True       # YouTube's auto-generated subtitles
-            pps.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
-
-    sponsor = options.get("sponsorblock")
-    if sponsor in ("mark", "remove"):
-        # The segments are fetched by _SafeSponsorBlock (added in _download_locked). ModifyChapters must run
-        # before FFmpegMetadata: it cuts the segments ("remove") or turns them into chapters ("mark").
-        cats = set(options.get("sponsor_categories") or SPONSOR_CATEGORIES) & set(SponsorBlockPP.CATEGORIES)
-        pps.append({"key": "ModifyChapters", "remove_sponsor_segments": cats if sponsor == "remove" else set(),
-                    "force_keyframes": False})
-    if options.get("metadata", True):
-        pps.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
-    elif sponsor == "mark":
-        pps.append({"key": "FFmpegMetadata", "add_metadata": False, "add_chapters": True})
-    if options.get("thumbnail", True):
-        opts["writethumbnail"] = True
-        pps.insert(0, {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
-        pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
-    return opts, pps
-
-
-# ---------------------------------------------------------------- storage
-
-class Store:
-    """The library on disk: SQLite, one row per playlist and per video, so a save only writes what changed.
-
-    WAL journaling with synchronous=FULL survives crashes and power loss; a damaged database is
-    moved aside (never deleted) and the latest backup is used instead.
-    """
-
-    SCHEMA = """
-        CREATE TABLE IF NOT EXISTS jobs  (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS items (job_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
-                                          PRIMARY KEY (job_id, id));
-        CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL,
-                                           job_id TEXT, job_title TEXT, item_id TEXT, title TEXT, url TEXT,
-                                           status TEXT, kind TEXT, error TEXT, bytes INTEGER, seconds REAL,
-                                           filepath TEXT, hidden INTEGER NOT NULL DEFAULT 0);
-        CREATE INDEX IF NOT EXISTS events_time ON events (time);
-    """
-    EVENT_COLS = ("time", "job_id", "job_title", "item_id", "title", "url", "status", "kind", "error", "bytes",
-                  "seconds", "filepath")
-
-    def __init__(self, path: Path, backup: Path):
-        self.path, self.backup_path = path, backup
-        self._lock = threading.Lock()     # one connection, shared by the workers and the saver
-        try:
-            self.conn = self._connect()
-        except sqlite3.DatabaseError as exc:
-            aside = path.with_name(f"library.damaged-{int(time.time())}.db")
-            log.error("Library database is damaged (%s); kept it as %s and loading the backup", exc, aside.name)
-            print(f"Library database was damaged; kept it as {aside.name} and loaded the backup.", file=sys.stderr)
-            for suffix in ("", "-wal", "-shm"):
-                src = Path(str(path) + suffix)
-                if src.exists():
-                    src.replace(Path(str(aside) + suffix))
-            if backup.exists():
-                shutil.copyfile(backup, path)
-            self.conn = self._connect()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.executescript(self.SCHEMA)
-            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise sqlite3.DatabaseError("integrity check failed")
-            self.version = conn.execute("PRAGMA user_version").fetchone()[0]   # 0: event log not filled yet
-        except sqlite3.DatabaseError:
-            conn.close()
-            raise
-        return conn
-
-    def load(self) -> list[dict]:
-        with self._lock:
-            jobs = {jid: json.loads(data) for jid, data in self.conn.execute("SELECT id, data FROM jobs")}
-            for job in jobs.values():
-                job["items"] = []
-            for jid, data in self.conn.execute("SELECT job_id, data FROM items"):
-                if jid in jobs:
-                    jobs[jid]["items"].append(json.loads(data))
-        for job in jobs.values():
-            job["items"].sort(key=lambda it: it.get("index", 0))
-        return list(jobs.values())
-
-    def write(self, jobs: list[tuple[str, str]], items: list[tuple[str, str, str]], deleted: list[str]):
-        if not (jobs or items or deleted):
-            return
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            try:
-                cur.executemany("DELETE FROM items WHERE job_id = ?", [(j,) for j in deleted])
-                cur.executemany("DELETE FROM jobs WHERE id = ?", [(j,) for j in deleted])
-                cur.executemany("INSERT OR REPLACE INTO jobs (id, data) VALUES (?, ?)", jobs)
-                cur.executemany("INSERT OR REPLACE INTO items (job_id, id, data) VALUES (?, ?, ?)", items)
-                cur.execute("COMMIT")
-            except BaseException:
-                cur.execute("ROLLBACK")
-                raise
-
-    def backup(self):
-        tmp = self.backup_path.with_name(self.backup_path.name + ".tmp")
-        dst = sqlite3.connect(tmp)
-        try:
-            with self._lock:
-                self.conn.backup(dst)
-        finally:
-            dst.close()
-        os.replace(tmp, self.backup_path)
-
-    # ---- event log: one row per finished or failed download, kept even when the video is retried later
-
-    def add_events(self, rows: list[dict]) -> int:
-        """Append events; returns the id of the last one."""
-        if not rows:
-            return self.last_event_id()
-        cols = ", ".join(self.EVENT_COLS)
-        marks = ", ".join("?" * len(self.EVENT_COLS))
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            try:
-                cur.executemany(f"INSERT INTO events ({cols}) VALUES ({marks})",
-                                [tuple(r.get(c) for c in self.EVENT_COLS) for r in rows])
-                cur.execute("COMMIT")
-            except BaseException:
-                cur.execute("ROLLBACK")
-                raise
-            return cur.lastrowid
-
-    def set_version(self, version: int):
-        with self._lock:
-            self.conn.execute(f"PRAGMA user_version = {int(version)}")
-            self.version = version
-
-    def last_event_id(self) -> int:
-        with self._lock:
-            return self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
-
-    def events(self, offset: int = 0, limit: int = 30, since_id: int = 0, hidden: bool = False) -> list[dict]:
-        """Newest first. hidden=False leaves out rows the user cleared from "Recently finished"."""
-        where = "id > ?" + ("" if hidden else " AND hidden = 0")
-        with self._lock:
-            cur = self.conn.execute(f"SELECT id, {', '.join(self.EVENT_COLS)} FROM events WHERE {where} "
-                                    "ORDER BY time DESC, id DESC LIMIT ? OFFSET ?", (since_id, limit, offset))
-            names = [d[0] for d in cur.description]
-            return [dict(zip(names, row)) for row in cur.fetchall()]
-
-    def all_events(self) -> list[dict]:
-        """Every event, oldest first, with its hidden flag (for "Export all data")."""
-        cols = (*self.EVENT_COLS, "hidden")
-        with self._lock:
-            rows = self.conn.execute(f"SELECT {', '.join(cols)} FROM events ORDER BY id").fetchall()
-        return [dict(zip(cols, row)) for row in rows]
-
-    def merge_events(self, rows: list[dict]) -> int:
-        """Add imported events that aren't in the log yet (same time, playlist, video and status); returns how many."""
-        cols = (*self.EVENT_COLS, "hidden")
-        with self._lock:
-            have = set(self.conn.execute("SELECT time, job_id, item_id, status FROM events"))
-            new, seen = [], set()
-            for r in sorted(rows, key=lambda r: r["time"]):
-                key = (r["time"], r.get("job_id"), r.get("item_id"), r.get("status"))
-                if key not in have and key not in seen:
-                    seen.add(key)
-                    new.append(tuple(int(bool(r.get(c))) if c == "hidden" else r.get(c) for c in cols))
-            if not new:
-                return 0
-            cur = self.conn.cursor()
-            cur.execute("BEGIN IMMEDIATE")
-            try:
-                cur.executemany(f"INSERT INTO events ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})", new)
-                cur.execute("COMMIT")
-            except BaseException:
-                cur.execute("ROLLBACK")
-                raise
-            return len(new)
-
-    def count_events(self, hidden: bool = False) -> int:
-        with self._lock:
-            return self.conn.execute("SELECT COUNT(*) FROM events" + ("" if hidden else " WHERE hidden = 0")).fetchone()[0]
-
-    def counts_since(self, since: float) -> dict[str, int]:
-        with self._lock:
-            return dict(self.conn.execute("SELECT status, COUNT(*) FROM events WHERE time >= ? GROUP BY status",
-                                          (since,)).fetchall())
-
-    def hide_events(self) -> int:
-        with self._lock:
-            return self.conn.execute("UPDATE events SET hidden = 1 WHERE hidden = 0").rowcount
-
-    def stats(self, since: float) -> dict:
-        """Totals and per-day figures for the History & stats view (all events, cleared or not)."""
-        with self._lock:
-            days = self.conn.execute(
-                "SELECT date(time, 'unixepoch', 'localtime') AS day, "
-                "SUM(status = 'done'), SUM(status = 'failed'), COALESCE(SUM(CASE WHEN status = 'done' THEN bytes END), 0) "
-                "FROM events WHERE time >= ? GROUP BY day ORDER BY day", (since,)).fetchall()
-            done, failed, total_bytes = self.conn.execute(
-                "SELECT COALESCE(SUM(status = 'done'), 0), COALESCE(SUM(status = 'failed'), 0), "
-                "COALESCE(SUM(CASE WHEN status = 'done' THEN bytes END), 0) FROM events WHERE time >= ?",
-                (since,)).fetchone()
-            timed_bytes, seconds = self.conn.execute(
-                "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(seconds), 0) FROM events "
-                "WHERE time >= ? AND status = 'done' AND seconds > 0 AND bytes > 0", (since,)).fetchone()
-            kinds = self.conn.execute(
-                "SELECT COALESCE(kind, 'other'), COUNT(*) FROM events WHERE time >= ? AND status = 'failed' "
-                "GROUP BY 1 ORDER BY 2 DESC LIMIT 6", (since,)).fetchall()
-        return {
-            "days": [{"day": d, "done": n or 0, "failed": f or 0, "bytes": b or 0} for d, n, f, b in days],
-            "done": done, "failed": failed, "bytes": total_bytes,
-            "success": round(100 * done / (done + failed), 1) if done + failed else None,
-            "avg_speed": timed_bytes / seconds if seconds else None,
-            "kinds": [{"kind": k, "count": c} for k, c in kinds],
-        }
-
-
-def _read_legacy_state() -> list:
-    """The old JSON library (state.json), falling back to its backup if damaged."""
-    for path in (LEGACY_STATE, LEGACY_BACKUP):
-        try:
-            return json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-    return []
-
+from .formats import (
+    AUDIO_FORMATS,
+    SPONSOR_CATEGORIES,
+    VIDEO_HEIGHTS,
+    _estimate_bytes,
+    _FormatNote,
+    _PlaylistTags,
+    _SafeSponsorBlock,
+    build_format_opts,
+)
+from .settings import DEFAULT_SETTINGS, _coerce_settings, _minutes
+from .store import Store, _read_legacy_state
+from .util import (
+    ANSI,
+    _atomic_write,
+    _escape_tmpl,
+    _expected_duration,
+    _fmt_secs,
+    _parse_section,
+    _safe_name,
+    _section_label,
+)
+from .verify import DAMAGED, _check_part_sizes, _decodes_fully, _has_cover
+from .ytdlp import _base_opts, _ItemLogger, _ytdl
 
 # ---------------------------------------------------------------- library manager
 #
@@ -1231,16 +131,16 @@ PP_QUIET = {"ThumbnailsConvertor", "SponsorBlock", "MoveFilesAfterDownload"}   #
 
 class Manager:
     def __init__(self):
-        DATA_DIR.mkdir(exist_ok=True)
+        config.DATA_DIR.mkdir(exist_ok=True)
         # One app per library: a second copy would fight over the same database and files.
-        self._instance_lock = _FileLock(DATA_DIR / ".lock")
+        self._instance_lock = _FileLock(config.DATA_DIR / ".lock")
         if not self._instance_lock.acquire():
-            raise AlreadyRunning(f"YT Downloader is already running with this library ({DATA_DIR}).")
+            raise AlreadyRunning(f"YT Downloader is already running with this library ({config.DATA_DIR}).")
         setup_logging()
         self.cond = threading.Condition(threading.RLock())
         self.jobs: dict[str, dict] = {}
         try:
-            self.settings = _coerce_settings(json.loads(SETTINGS_FILE.read_text()))
+            self.settings = _coerce_settings(json.loads(config.SETTINGS_FILE.read_text()))
         except (OSError, ValueError):
             self.settings = _coerce_settings({})
         self.active = 0
@@ -1269,13 +169,13 @@ class Manager:
         self._disk_cache: dict[str, tuple] = {}        # folder -> (time, _disk_free result)
         self.updating: dict | None = None              # progress of a yt-dlp update
         self._latest = {"version": None, "checked": 0, "checking": False}   # newest yt-dlp on PyPI
-        shutil.rmtree(DATA_DIR / ".cookies-tmp", ignore_errors=True)   # copies left by a crash
-        self.store = Store(DB_FILE, DB_BACKUP)
+        shutil.rmtree(config.DATA_DIR / ".cookies-tmp", ignore_errors=True)   # copies left by a crash
+        self.store = Store(config.DB_FILE, config.DB_BACKUP)
         self._load_state()
         self.last_event = self.store.last_event_id()
         if self.store.version < 1:
             self._backfill_events()
-        if not DB_BACKUP.exists():
+        if not config.DB_BACKUP.exists():
             self.store.backup()                          # never run without a backup to fall back on
         log.info("Started with %d playlists", len(self.jobs))
         for i in range(MAX_WORKERS):
@@ -1314,7 +214,7 @@ class Manager:
     def _load_state(self):
         jobs = self.store.load()
         migrated = False
-        if not jobs and (LEGACY_STATE.exists() or LEGACY_BACKUP.exists()):
+        if not jobs and (config.LEGACY_STATE.exists() or config.LEGACY_BACKUP.exists()):
             jobs, migrated = _read_legacy_state(), True
         for job in jobs:
             self._normalize_job(job)
@@ -1327,7 +227,7 @@ class Manager:
                 self._saved_rev[job["id"]] = job["rev"]
         if migrated:
             self.save_state()                            # write everything into the database first …
-            for path in (LEGACY_STATE, LEGACY_BACKUP):   # … then retire the JSON files (kept, not deleted)
+            for path in (config.LEGACY_STATE, config.LEGACY_BACKUP):   # … then retire the JSON files (kept, not deleted)
                 if path.exists():
                     path.replace(path.with_name(path.name + ".migrated"))
             log.info("Moved %d playlists from state.json into library.db", len(jobs))
@@ -1448,7 +348,7 @@ class Manager:
         with self.cond:
             old = self.settings
             self.settings = _coerce_settings(self.settings | {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
-            _atomic_write(SETTINGS_FILE, json.dumps(self.settings, indent=2))
+            _atomic_write(config.SETTINGS_FILE, json.dumps(self.settings, indent=2))
             self.version += 1
             self.cond.notify_all()
             self._rebalance()
@@ -1735,7 +635,7 @@ class Manager:
 
     def open_url(self, url: str) -> dict:
         """Fetch a link and save it in the library (or update the saved copy). Returns the summary."""
-        info = inspect_url(url, self.settings)          # slow network call: outside the lock
+        info = extract.inspect_url(url, self.settings)          # slow network call: outside the lock
         with self.cond:
             job = next((j for j in self.jobs.values()
                         if (info.get("source_id") and j.get("source_id") == info["source_id"]) or j["url"] == url), None)
@@ -1846,7 +746,7 @@ class Manager:
     def _refresh(self, job_id: str) -> list[str]:
         """Fetch the playlist again; returns the ids of new videos."""
         job = self.get(job_id)
-        info = inspect_url(job["url"], self.settings)
+        info = extract.inspect_url(job["url"], self.settings)
         new_ids: list[str] = []
         with self.cond:
             added = self._merge(job, info, new_ids)
@@ -2103,9 +1003,9 @@ class Manager:
                         [p for p in candidates(it) if p != known]
                 work.append((it, it["status"], paths))
 
-        def verify(path: str, duration: float | None) -> tuple[str | None, bool]:
+        def check_file(path: str, duration: float | None) -> tuple[str | None, bool]:
             """-> (problem, rescued). A file ffprobe can't open is only damaged if it also fails a full decode."""
-            problem = _verify_file(path, duration)
+            problem = verify._verify_file(path, duration)
             if problem == DAMAGED and _decodes_fully(path, duration):
                 return None, True
             return problem, False
@@ -2119,10 +1019,10 @@ class Manager:
                     if not paths:
                         outcome, path, problem, rescued = "missing", None, None, False
                     else:
-                        path, (problem, rescued) = paths[0], verify(paths[0], _expected_duration(it))
+                        path, (problem, rescued) = paths[0], check_file(paths[0], _expected_duration(it))
                         outcome = "damaged" if problem else "ok"
                 elif paths:                                   # not marked downloaded, but a file is there
-                    path, (problem, rescued) = paths[0], verify(paths[0], it.get("duration"))
+                    path, (problem, rescued) = paths[0], check_file(paths[0], it.get("duration"))
                     outcome = "damaged-copy" if problem else "found"
                 else:
                     outcome, path, problem, rescued = "nothing", None, None, False
@@ -2329,7 +1229,7 @@ class Manager:
                 path = item.get("filepath")
                 if not path or not os.path.isfile(path):
                     raise ValueError("The file isn't in the folder any more")
-                _open_path(path, reveal=action == "reveal")
+                files._open_path(path, reveal=action == "reveal")
                 return
             elif action == "delete-file":
                 self._delete_files(job, item)
@@ -3068,7 +1968,7 @@ class Manager:
                     raise _IncompleteFile(bad)
                 live = info.get("is_live") or info.get("was_live")
                 self._set(job, item, step="Verifying")
-                problem = _verify_file(filepath, None if live else expected)
+                problem = verify._verify_file(filepath, None if live else expected)
                 if not problem:
                     break
                 if filepath and os.path.isfile(filepath):
@@ -3190,20 +2090,3 @@ class Manager:
             self._event(job, item, "failed", kind)
         if kind == "network":
             self.on_network_error()
-
-
-def _open_path(path: str, reveal: bool = False):
-    """Open a file or folder in its default app; reveal=True shows the file in Finder/Explorer instead."""
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
-    elif sys.platform.startswith("win"):
-        if reveal:
-            subprocess.Popen(["explorer", f"/select,{path}"])
-        else:
-            os.startfile(path)  # type: ignore[attr-defined]
-    else:
-        subprocess.Popen(["xdg-open", os.path.dirname(path) if reveal else path])
-
-
-def _open_folder(path: str):
-    _open_path(path)

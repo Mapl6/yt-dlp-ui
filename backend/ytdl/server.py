@@ -24,7 +24,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .manager import ROOT, AlreadyRunning, Manager, _clean_error, check_cookies, cookie_sources
+from .config import ROOT
+from .cookies import check_cookies, cookie_sources
+from .errors import AlreadyRunning, _clean_error
+from .manager import Manager
 from .netcheck import NetMonitor
 
 STATIC = ROOT / "static"

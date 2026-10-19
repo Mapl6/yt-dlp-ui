@@ -2,7 +2,7 @@
 
 Usage: python verify_folder.py <folder> [--full] [--id VIDEO_ID ...]
 
-For each video file (named "... [<id>].<ext>") it runs the app's own check (ytdl.manager._verify_file:
+For each video file (named "... [<id>].<ext>") it runs the app's own check (ytdl.verify._verify_file:
 ffprobe + decode the last seconds). --full also decodes the whole file (slow: ~2-3 min per hour of video)
 to catch damage in the middle. It also lists leftovers (.part, unmerged .fNNN streams, .damaged).
 """
@@ -16,7 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "backend"))
-from ytdl.manager import FINAL_FILE, LEFTOVER, _verify_file  # noqa: E402  (import has no side effects)
+from ytdl.files import FINAL_FILE, LEFTOVER  # noqa: E402
+from ytdl.verify import _verify_file  # noqa: E402  (import has no side effects)
 
 
 def full_decode(path: str) -> str | None:

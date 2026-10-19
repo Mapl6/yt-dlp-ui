@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+from ytdl import config
 from ytdl import manager as M
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,20 +14,20 @@ PATH_GLOBALS = ("DATA_DIR", "DB_FILE", "DB_BACKUP", "LEGACY_STATE", "LEGACY_BACK
 
 
 def use_data_dir(path) -> dict:
-    """Point manager.py's library paths (computed at import) at `path`. Returns the previous values.
+    """Point the library paths in ytdl.config (computed at import) at `path`. Returns the previous values.
     LOG_FILE is left alone: the log handler is set up once per process."""
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
-    before = {k: getattr(M, k) for k in PATH_GLOBALS}
-    M.DATA_DIR, M.DB_FILE, M.DB_BACKUP = path, path / "library.db", path / "library.backup.db"
-    M.LEGACY_STATE, M.LEGACY_BACKUP = path / "state.json", path / "state.backup.json"
-    M.SETTINGS_FILE = path / "settings.json"
+    before = {k: getattr(config, k) for k in PATH_GLOBALS}
+    config.DATA_DIR, config.DB_FILE, config.DB_BACKUP = path, path / "library.db", path / "library.backup.db"
+    config.LEGACY_STATE, config.LEGACY_BACKUP = path / "state.json", path / "state.backup.json"
+    config.SETTINGS_FILE = path / "settings.json"
     return before
 
 
 def restore_paths(before: dict):
     for k, v in before.items():
-        setattr(M, k, v)
+        setattr(config, k, v)
 
 
 class Net:

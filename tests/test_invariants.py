@@ -6,6 +6,7 @@ import textwrap
 
 import pytest
 
+from ytdl import config, verify
 from ytdl import manager as M
 from helpers import ROOT, items_of, make_job, wait
 
@@ -26,9 +27,9 @@ def download(mgr, net, job, out, timeout=90):
 @pytest.mark.slow
 def test_archive_written_only_after_verification(mgr, net, out, fake, monkeypatch):
     events = []
-    real_verify, real_add = M._verify_file, mgr._archive_add
+    real_verify, real_add = verify._verify_file, mgr._archive_add
 
-    def verify(path, duration):
+    def spy_verify(path, duration):
         result = real_verify(path, duration)
         events.append(("verify", result))
         return result
@@ -37,7 +38,7 @@ def test_archive_written_only_after_verification(mgr, net, out, fake, monkeypatc
         events.append(("archive", k))
         return real_add(outdir, k)
 
-    monkeypatch.setattr(M, "_verify_file", verify)
+    monkeypatch.setattr(verify, "_verify_file", spy_verify)
     monkeypatch.setattr(mgr, "_archive_add", add)
     job = make_job(mgr, out, "verified", ["ok2"])
     it = items_of(job)["ok2"]
@@ -50,7 +51,7 @@ def test_archive_written_only_after_verification(mgr, net, out, fake, monkeypatc
 
 @pytest.mark.slow
 def test_failed_verification_never_archived(mgr, net, out, fake, monkeypatch):
-    monkeypatch.setattr(M, "_verify_file", lambda path, duration: "The end of the file is missing")
+    monkeypatch.setattr(verify, "_verify_file", lambda path, duration: "The end of the file is missing")
     job = make_job(mgr, out, "unverified", ["bad2"])
     it = items_of(job)["bad2"]
     try:
@@ -82,7 +83,7 @@ def test_part_of_a_video_ignores_the_archive(mgr, net, out, fake):
     job = make_job(mgr, out, "part", ["pt1"])
     it = items_of(job)["pt1"]
     mgr._archive_add(str(out), key(it))
-    lines = (out / M.ARCHIVE_NAME).read_text().count(key(it))
+    lines = (out / config.ARCHIVE_NAME).read_text().count(key(it))
     try:
         mgr.queue(job["id"], None, dict(OPTS, output_dir=str(out), section={"start": "0:01", "end": "0:04"}))
         net.level = "good"
@@ -91,7 +92,7 @@ def test_part_of_a_video_ignores_the_archive(mgr, net, out, fake):
         net.level = "offline"
     assert it["status"] == "done", f"downloaded, not skipped: {(it['status'], it['error'])}"
     assert "(0-01–0-04) [pt1]" in (it["filepath"] or ""), it["filepath"]
-    assert (out / M.ARCHIVE_NAME).read_text().count(key(it)) == lines, "the archive is unchanged"
+    assert (out / config.ARCHIVE_NAME).read_text().count(key(it)) == lines, "the archive is unchanged"
     mgr._archive_remove(str(out), key(it))
 
 

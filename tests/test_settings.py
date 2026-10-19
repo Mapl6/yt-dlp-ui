@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from ytdl import manager as M
+from ytdl import config, settings
 from helpers import stop_manager
 
 VALUES = {"concurrency": 5, "cookies_browser": "firefox", "cookies_profile": "abc.default-release",
@@ -18,8 +18,8 @@ def all_values(tmp_path):
 
 def test_values_cover_every_setting(tmp_path):
     values = all_values(tmp_path)
-    assert set(values) == set(M.DEFAULT_SETTINGS), set(values) ^ set(M.DEFAULT_SETTINGS)
-    assert all(values[k] != M.DEFAULT_SETTINGS[k] for k in values)
+    assert set(values) == set(settings.DEFAULT_SETTINGS), set(values) ^ set(settings.DEFAULT_SETTINGS)
+    assert all(values[k] != settings.DEFAULT_SETTINGS[k] for k in values)
 
 
 def test_every_setting_survives_a_restart(tmp_path, make_manager):
@@ -37,7 +37,7 @@ def test_unknown_settings_ignored(tmp_path, make_manager):
     m = make_manager(tmp_path / "lib")
     saved = m.update_settings({"concurrency": 2, "evil": "x", "__class__": 1})
     assert "evil" not in saved and "__class__" not in saved and saved["concurrency"] == 2
-    assert "evil" not in json.loads(M.SETTINGS_FILE.read_text())
+    assert "evil" not in json.loads(config.SETTINGS_FILE.read_text())
 
 
 def test_damaged_settings_file_falls_back(tmp_path, make_manager):
@@ -45,13 +45,13 @@ def test_damaged_settings_file_falls_back(tmp_path, make_manager):
     data.mkdir()
     (data / "settings.json").write_text("{not json")
     m = make_manager(data)
-    assert m.settings == M._coerce_settings({})
+    assert m.settings == settings._coerce_settings({})
 
 
 COERCE = [
     ({"concurrency": "2.7"}, "concurrency", 2),
     ({"concurrency": 0}, "concurrency", 1),
-    ({"concurrency": 99}, "concurrency", M.MAX_WORKERS),
+    ({"concurrency": 99}, "concurrency", config.MAX_WORKERS),
     ({"concurrency": None}, "concurrency", 3),
     ({"rate_limit_mb": -4}, "rate_limit_mb", 0.0),
     ({"rate_limit_mb": "2"}, "rate_limit_mb", 2.0),
@@ -63,7 +63,7 @@ COERCE = [
     ({"schedule_on": "on"}, "schedule_on", True),
     ({"proxy": "  socks5://127.0.0.1:1080  "}, "proxy", "socks5://127.0.0.1:1080"),
     ({"proxy": None}, "proxy", ""),
-    ({"output_dir": ""}, "output_dir", M.DEFAULT_SETTINGS["output_dir"]),
+    ({"output_dir": ""}, "output_dir", settings.DEFAULT_SETTINGS["output_dir"]),
     ({"schedule_start": "7:05"}, "schedule_start", "07:05"),
     ({"schedule_end": "25:00"}, "schedule_end", "07:00"),
     ({"schedule_start": "noon"}, "schedule_start", "01:00"),
@@ -72,8 +72,8 @@ COERCE = [
 
 @pytest.mark.parametrize("raw,key,want", COERCE, ids=[f"{k}={r[k]!r}" for r, k, _ in COERCE])
 def test_coerce(raw, key, want):
-    assert M._coerce_settings(raw)[key] == want
+    assert settings._coerce_settings(raw)[key] == want
 
 
 def test_coerced_settings_are_complete():
-    assert set(M._coerce_settings({"junk": 1})) == set(M.DEFAULT_SETTINGS)
+    assert set(settings._coerce_settings({"junk": 1})) == set(settings.DEFAULT_SETTINGS)

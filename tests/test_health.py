@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ytdl import extract, files, formats, verify
 from ytdl import manager as M
 from helpers import entry, wait
 
@@ -15,7 +16,7 @@ OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": F
 
 
 def listing():
-    return {"kind": "playlist", "source_id": "H", "title": "Health", "thumbnail": None, "heights": M.VIDEO_HEIGHTS,
+    return {"kind": "playlist", "source_id": "H", "title": "Health", "thumbnail": None, "heights": formats.VIDEO_HEIGHTS,
             "items": [entry(i + 1, v, duration=30) for i, v in enumerate(IDS)]}
 
 
@@ -80,7 +81,7 @@ def test_check_files(mgr, health, checked, out):
 def test_refresh_flags_missing_file(mgr, health, out, monkeypatch):
     # refresh: quick missing-file check
     (out / "01 - Video A [A].mp4").unlink(missing_ok=True)
-    monkeypatch.setattr(M, "inspect_url", lambda url, settings: listing())
+    monkeypatch.setattr(extract, "inspect_url", lambda url, settings: listing())
     mgr.refresh(health.job["id"])
     a = health.items["A"]
     assert a["status"] == "failed" and a["file_problem"] == "missing", \
@@ -116,13 +117,13 @@ def test_part_sizes(tmp_path):
     p2.write_bytes(b"b" * 50)
     info = {"requested_formats": [{"format_id": "137", "filesize": 100, "protocol": "https"},
                                   {"format_id": "140", "filesize": 50, "protocol": "https"}]}
-    assert M._check_part_sizes(info, {"137": p1, "140": p2}) is None, "size: exact sizes pass"
+    assert verify._check_part_sizes(info, {"137": p1, "140": p2}) is None, "size: exact sizes pass"
     info["requested_formats"][1]["filesize"] = 60
-    assert "140" in (M._check_part_sizes(info, {"137": p1, "140": p2}) or ""), "size: wrong size detected"
+    assert "140" in (verify._check_part_sizes(info, {"137": p1, "140": p2}) or ""), "size: wrong size detected"
     info["requested_formats"][1]["protocol"] = "m3u8_native"
-    assert M._check_part_sizes(info, {"137": p1, "140": p2}) is None, \
+    assert verify._check_part_sizes(info, {"137": p1, "140": p2}) is None, \
         "size: fragmented streams (no exact size) are not compared"
-    assert set(M._part_files(str(tmp_path), "v")) == {"137", "140"}, "size: part files found by id"
+    assert set(files._part_files(str(tmp_path), "v")) == {"137", "140"}, "size: part files found by id"
 
 
 # ---------- merged downloads from a local server (separate video + audio streams)
@@ -163,20 +164,20 @@ def test_merged_download(mgr, net, merge):
     mit = merge.it
     assert mit["status"] == "done" and mit["health"] == "ok", \
         f"merge: downloaded and verified: {(mit['status'], mit['error'])}"
-    assert not M._part_files(str(merge.out), "mergevid"), "merge: separate streams deleted after verification"
-    assert M._verify_file(mit["filepath"], 30) is None, "merge: final file plays to the end"
+    assert not files._part_files(str(merge.out), "mergevid"), "merge: separate streams deleted after verification"
+    assert verify._verify_file(mit["filepath"], 30) is None, "merge: final file plays to the end"
 
 
 @pytest.mark.slow
 def test_remerge_from_kept_streams(mgr, net, merge, media_server, monkeypatch):
     # the first merged file "fails" verification -> merged again locally, nothing downloaded again
-    real_verify, calls = M._verify_file, {"n": 0}
+    real_verify, calls = verify._verify_file, {"n": 0}
 
     def flaky_verify(path, duration):
         calls["n"] += 1
         return "The end of the file is missing" if calls["n"] == 1 else real_verify(path, duration)
 
-    monkeypatch.setattr(M, "_verify_file", flaky_verify)
+    monkeypatch.setattr(verify, "_verify_file", flaky_verify)
     before = media_server.gets
     run_download(mgr, net, merge)
     downloads_first = media_server.gets - before
@@ -199,8 +200,8 @@ def test_cover_and_metadata(mgr, net, merge, fake, media_server, media):
     try:
         run_download(mgr, net, merge, thumbnail=True, metadata=True)
         assert mit["status"] == "done", f"cover: downloaded and verified: {(mit['status'], mit['error'])}"
-        assert M._has_cover(mit["filepath"]), "cover: picture embedded in the video"
-        left = [p.name for p in M._files_for(str(mout), "mergevid") if M.SIDECAR.search(p.name)]
+        assert verify._has_cover(mit["filepath"]), "cover: picture embedded in the video"
+        left = [p.name for p in files._files_for(str(mout), "mergevid") if files.SIDECAR.search(p.name)]
         assert not left, f"cover: no separate thumbnail file left: {left}"
         tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", mit["filepath"]],
                               capture_output=True, text=True).stdout
@@ -209,7 +210,7 @@ def test_cover_and_metadata(mgr, net, merge, fake, media_server, media):
         (mout / "Merge test [mergevid].webp").write_bytes(b"x" * 100)    # left by an older version of the app
         assert mgr.cleanup(mjob["id"], dry_run=True)["names"] == ["Merge test [mergevid].webp"], \
             "cleanup: thumbnail of a video that has the cover inside is a leftover"
-        assert not M._has_cover(str(media / "full.mp4")), "cover: a file without a cover is detected"
+        assert not verify._has_cover(str(media / "full.mp4")), "cover: a file without a cover is detected"
     finally:
         fake.extra = {}
         with mgr.cond:
@@ -230,6 +231,6 @@ def test_stream_size_mismatch(mgr, net, merge, fake):
     try:
         assert mit["status"] == "queued" and "wrong size" in (mit["error"] or ""), \
             f"size mismatch: not marked done, retried: {(mit['status'], mit['error'])}"
-        assert not M._part_files(str(merge.out), "mergevid"), "size mismatch: bad streams removed"
+        assert not files._part_files(str(merge.out), "mergevid"), "size mismatch: bad streams removed"
     finally:
         mgr.action(merge.job["id"], "stop")

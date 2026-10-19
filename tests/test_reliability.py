@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ytdl import config, cookies, errors, files, settings, store, verify, ytdlp
 from ytdl import manager as M
 from helpers import wait_status
 
@@ -60,24 +61,24 @@ CASES = {
 
 @pytest.mark.parametrize("msg,want", CASES.items(), ids=[f"classify {w:9} <- {m[:45]}" for m, w in CASES.items()])
 def test_classify(msg, want):
-    assert M._error_kind(msg) == want
+    assert errors._error_kind(msg) == want
 
 
 def test_settings_coercion():
-    s = M._coerce_settings({"concurrency": "abc", "rate_limit_mb": "x", "sleep_between": "2.5", "wait_for_network": "false"})
+    s = settings._coerce_settings({"concurrency": "abc", "rate_limit_mb": "x", "sleep_between": "2.5", "wait_for_network": "false"})
     assert s["concurrency"] == 3 and s["rate_limit_mb"] == 0.0 and s["sleep_between"] == 2.5 \
         and s["wait_for_network"] is False, f"settings: bad values fall back: {s}"
-    assert M._coerce_settings({"concurrency": 99})["concurrency"] == 8, "settings: concurrency clamped"
+    assert settings._coerce_settings({"concurrency": 99})["concurrency"] == 8, "settings: concurrency clamped"
 
 
 def test_verify_file(media, tmp_path):
     src = media / "full.mp4"
-    assert M._verify_file(str(src), 30) is None, "verify: good file passes"
-    assert "incomplete" in (M._verify_file(str(src), 120) or ""), "verify: short file detected"
+    assert verify._verify_file(str(src), 30) is None, "verify: good file passes"
+    assert "incomplete" in (verify._verify_file(str(src), 120) or ""), "verify: short file detected"
     trunc = tmp_path / "trunc.mp4"
     trunc.write_bytes(src.read_bytes()[: src.stat().st_size // 3])
-    assert M._verify_file(str(trunc), 30) is not None, "verify: truncated file detected"
-    assert M._verify_file(str(tmp_path / "nope.mp4"), 30) is not None, "verify: missing file detected"
+    assert verify._verify_file(str(trunc), 30) is not None, "verify: truncated file detected"
+    assert verify._verify_file(str(tmp_path / "nope.mp4"), 30) is not None, "verify: missing file detected"
 
 
 def test_flaky_download_resumes(mgr, net, job, it, out, flaky_server, good):
@@ -166,13 +167,13 @@ def test_rate_limit_waves(mgr, monkeypatch):
     for _ in range(2):
         v["status"] = "downloading"
         mgr._handle_failure(FJ, v, Exception("Unable to download video data: <urlopen error timed out>"))
-    for _ in range(M.MAX_RATE_STRIKES + 2):
+    for _ in range(config.MAX_RATE_STRIKES + 2):
         v["status"] = "downloading"
         mgr._handle_failure(FJ, v, BOT)
-    assert v["net_attempts"] == 2 and v["rate_attempts"] == M.MAX_RATE_STRIKES + 2, \
+    assert v["net_attempts"] == 2 and v["rate_attempts"] == config.MAX_RATE_STRIKES + 2, \
         f"rate limit: network and rate-limit errors are counted apart: {(v['net_attempts'], v['rate_attempts'])}"
     assert v["status"] == "queued", f"rate limit: a block on every video never fails the video: {(v['status'], v['error'])}"
-    for _ in range(M.RATE_BLOCK_STRIKES):
+    for _ in range(config.RATE_BLOCK_STRIKES):
         time.sleep(0.01)
         mgr._handle_failure(FJ, fake_item("again", time.time()), BOT)
     assert "cookies" in mgr.hold["reason"] and "VPN" in mgr.hold["reason"], \
@@ -194,9 +195,9 @@ def test_rate_limit_waves(mgr, monkeypatch):
 
 def test_cookie_errors(mgr):
     # one pause with an explanation, no attempts used, cleared by changing the cookie settings
-    assert M._error_kind(CHROME) == "cookies", "classify cookies  <- could not find chrome cookies database"
-    assert M._error_kind(M.CookieLoadError("failed to load cookies")) == "cookies", "classify cookies  <- CookieLoadError"
-    assert M._error_kind(BOT) == "ratelimit", "classify ratelimit <- bot check that mentions --cookies"
+    assert errors._error_kind(CHROME) == "cookies", "classify cookies  <- could not find chrome cookies database"
+    assert errors._error_kind(errors.CookieLoadError("failed to load cookies")) == "cookies", "classify cookies  <- CookieLoadError"
+    assert errors._error_kind(BOT) == "ratelimit", "classify ratelimit <- bot check that mentions --cookies"
     mgr.update_settings({"cookies_browser": "chrome"})
     try:
         c = fake_item("c1", time.time())
@@ -213,7 +214,7 @@ def test_cookie_errors(mgr):
 def test_item_logger_prefix():
     # yt-dlp's messages start with ERROR:/WARNING: and the item log adds its own level
     got = []
-    lg = M._ItemLogger(lambda level, msg: got.append(msg))
+    lg = ytdlp._ItemLogger(lambda level, msg: got.append(msg))
     lg.error("ERROR: [youtube] abc: boom")
     lg.warning("\x1b[0;33mWARNING:\x1b[0m slow")
     assert got == ["[youtube] abc: boom", "slow"], f"item log: no doubled ERROR: prefix: {got}"
@@ -229,7 +230,7 @@ def test_cookie_sources(tmp_path, monkeypatch):
         json.dumps({"profile": {"info_cache": {"Profile 1": {"name": "Work"}}}}))
     (sup / "Google" / "Chrome" / "Crashpad").mkdir(parents=True)          # installed, but no profile with cookies
     monkeypatch.setenv("HOME", str(tmp_path))
-    found = {b["browser"]: b for b in M.cookie_sources()}
+    found = {b["browser"]: b for b in cookies.cookie_sources()}
     assert found.get("arc", {}).get("profiles") == [{"id": "Profile 1", "name": "Work"}], \
         f"cookie sources: Arc profile found with its name: {found.get('arc')}"
     assert found.get("chrome", {}).get("status") == "no-profiles", \
@@ -273,7 +274,7 @@ def test_inflight_never_twice(mgr, net, job, it):
 @pytest.mark.skipif(sys.platform == "win32", reason="the holder process uses fcntl")
 def test_cross_process_lock(mgr, net, job, it, out):
     # a video locked by another copy of the app is not touched
-    other = M._FileLock(M._lock_path(str(out), M.Manager._archive_key(it)))
+    other = files._FileLock(files._lock_path(str(out), M.Manager._archive_key(it)))
     script = (f"import fcntl,os,time; fd=os.open({str(other.path)!r}, os.O_RDWR|os.O_CREAT); "
               f"fcntl.flock(fd, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(8)")
     other.path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,7 +283,7 @@ def test_cross_process_lock(mgr, net, job, it, out):
         holder.stdout.readline()
         for f in out.glob("*.mp4"):
             f.unlink()
-        (out / M.ARCHIVE_NAME).unlink(missing_ok=True)
+        (out / config.ARCHIVE_NAME).unlink(missing_ok=True)
         it["status"] = "new"
         net.level = "good"
         mgr.queue(job["id"], None, dict(OPTS))
@@ -295,11 +296,11 @@ def test_cross_process_lock(mgr, net, job, it, out):
     finally:
         net.level = "offline"
         holder.kill()
-    assert not list((out / M.LOCK_DIR_NAME).glob("*.lock")), "lock: lock file cleaned up"
+    assert not list((out / config.LOCK_DIR_NAME).glob("*.lock")), "lock: lock file cleaned up"
 
 
 def test_instance_lock(mgr):
-    with pytest.raises(M.AlreadyRunning):
+    with pytest.raises(errors.AlreadyRunning):
         M.Manager()   # instance lock: second manager on same library refused
 
 
@@ -310,8 +311,8 @@ def test_damaged_database_recovered(mgr, job):
     mgr.store.backup()
     mgr.store.conn.close()
     for suffix in ("-wal", "-shm"):
-        Path(str(M.DB_FILE) + suffix).unlink(missing_ok=True)
-    M.DB_FILE.write_bytes(b"this is not a database" * 100)  # simulate a damaged file
-    jobs = M.Store(M.DB_FILE, M.DB_BACKUP).load()
+        Path(str(config.DB_FILE) + suffix).unlink(missing_ok=True)
+    config.DB_FILE.write_bytes(b"this is not a database" * 100)  # simulate a damaged file
+    jobs = store.Store(config.DB_FILE, config.DB_BACKUP).load()
     assert len(jobs) == 1 and jobs[0]["id"] == job["id"], "state: damaged database -> loaded backup"
-    assert list(M.DATA_DIR.glob("library.damaged-*.db")), "state: damaged database kept aside, not overwritten"
+    assert list(config.DATA_DIR.glob("library.damaged-*.db")), "state: damaged database kept aside, not overwritten"

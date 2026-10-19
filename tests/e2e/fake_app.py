@@ -32,7 +32,7 @@ if not settings.exists():
     settings.write_text('{"output_dir": "%s"}' % (work / "out"))
 sys.path[:0] = [str(ROOT / "backend"), str(ROOT / "tests")]
 
-from ytdl import manager as M  # noqa: E402
+from ytdl import extract  # noqa: E402
 from ytdl import netcheck  # noqa: E402
 from yt_dlp.utils import DownloadError  # noqa: E402
 
@@ -82,7 +82,7 @@ def inspect_url(url, settings):
                                         for i, v in enumerate(ids)]}
 
 
-M.inspect_url = inspect_url
+extract.inspect_url = inspect_url
 
 
 class Online:

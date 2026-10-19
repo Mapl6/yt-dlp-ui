@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from yt_dlp.utils import DownloadError
 
+from ytdl import config, cookies, extract, files, formats, settings, util, verify, ytdlp
 from ytdl import manager as M
 from helpers import items_of, make_job, new_manager, restore_paths, stop_manager, use_data_dir, wait
 
@@ -319,7 +320,7 @@ def test_file_actions(mgr, net, out, opts, j6, j7, monkeypatch):
         wait(lambda: it7["status"] == "done", 90)
         net.level = "offline"
     opened = []
-    monkeypatch.setattr(M, "_open_path", lambda path, reveal=False: opened.append((path, reveal)))
+    monkeypatch.setattr(files, "_open_path", lambda path, reveal=False: opened.append((path, reveal)))
     mgr.item_action(j7["id"], "slow1", "reveal")
     mgr.item_action(j7["id"], "slow1", "play")
     assert opened == [(it7["filepath"], True), (it7["filepath"], False)], f"reveal/play: the video's own file: {opened}"
@@ -351,14 +352,14 @@ def test_export_m3u(mgr, out, downloaded):
 def test_second_opinion_before_damaged(mgr, media, good, tmp_path, downloaded, monkeypatch):
     # no false "damaged": a file ffprobe can't open but that decodes fully is kept
     j3, it3 = downloaded.job, downloaded.it
-    assert M._decodes_fully(str(media / "full.mp4"), 30), "full decode: good file plays"
+    assert verify._decodes_fully(str(media / "full.mp4"), 30), "full decode: good file plays"
     junk = tmp_path / "junk.mp4"
     junk.write_bytes(os.urandom(50000))
-    assert not M._decodes_fully(str(junk), 30), "full decode: garbage fails"
+    assert not verify._decodes_fully(str(junk), 30), "full decode: garbage fails"
     cut = tmp_path / "cut.mp4"
     cut.write_bytes(good[: len(good) // 2])
-    assert not M._decodes_fully(str(cut), 30), "full decode: cut-off file fails"
-    monkeypatch.setattr(M, "_verify_file", lambda path, duration: M.DAMAGED)
+    assert not verify._decodes_fully(str(cut), 30), "full decode: cut-off file fails"
+    monkeypatch.setattr(verify, "_verify_file", lambda path, duration: verify.DAMAGED)
     mgr.start_check(j3["id"])
     wait(lambda: not j3["check"]["running"])
     monkeypatch.undo()
@@ -393,19 +394,19 @@ def test_remove_with_files(mgr, out, tmp_path):
 
 
 def test_subtitle_and_sponsorblock_options():
-    o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "en, fa", "auto_subs": True})
+    o, pps = formats.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "en, fa", "auto_subs": True})
     assert o["subtitleslangs"] == ["en", "en-.*", "fa", "fa-.*"], \
         f"subs: chosen languages with regional variants: {o['subtitleslangs']}"
     assert o.get("writeautomaticsub") is True, "subs: auto-generated subtitles"
-    o, pps = M.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "../etc; $(x)"})
+    o, pps = formats.build_format_opts({"quality": "720", "subtitles": True, "sub_langs": "../etc; $(x)"})
     assert o["subtitleslangs"] == ["en", "en-.*"], f"subs: bad language codes fall back to English: {o['subtitleslangs']}"
-    o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "remove"})
+    o, pps = formats.build_format_opts({"quality": "720", "sponsorblock": "remove"})
     keys = [p_["key"] for p_ in pps]
     mc = next(p_ for p_ in pps if p_["key"] == "ModifyChapters")
     assert keys.index("ModifyChapters") < keys.index("FFmpegMetadata") \
-        and mc["remove_sponsor_segments"] == set(M.SPONSOR_CATEGORIES), \
+        and mc["remove_sponsor_segments"] == set(formats.SPONSOR_CATEGORIES), \
         f"sponsorblock: segments cut before metadata is written: {(keys, mc)}"
-    o, pps = M.build_format_opts({"quality": "720", "sponsorblock": "mark", "metadata": False})
+    o, pps = formats.build_format_opts({"quality": "720", "sponsorblock": "mark", "metadata": False})
     assert any(p_["key"] == "FFmpegMetadata" and p_["add_chapters"] and not p_["add_metadata"] for p_ in pps) \
         and next(p_ for p_ in pps if p_["key"] == "ModifyChapters")["remove_sponsor_segments"] == set(), \
         "sponsorblock: mark adds chapters even without metadata"
@@ -413,11 +414,11 @@ def test_subtitle_and_sponsorblock_options():
 
 def test_sections():
     # parts of a video
-    assert M._parse_section({"start": "1:00", "end": "2:30.5"}) == {"start": 60.0, "end": 150.5}, "section: times parsed"
-    assert M._parse_section({"start": "90"}) == {"start": 90.0, "end": None}, "section: empty end = to the end"
-    assert M._parse_section({"start": "", "end": ""}) is None, "section: nothing asked"
-    assert M._section_label({"start": 60, "end": 150}) == "1-00–2-30", "section: file-name label"
-    assert M._expected_duration({"duration": 300, "options": {"section": {"start": 60, "end": None}}}) == 240, \
+    assert util._parse_section({"start": "1:00", "end": "2:30.5"}) == {"start": 60.0, "end": 150.5}, "section: times parsed"
+    assert util._parse_section({"start": "90"}) == {"start": 90.0, "end": None}, "section: empty end = to the end"
+    assert util._parse_section({"start": "", "end": ""}) is None, "section: nothing asked"
+    assert util._section_label({"start": 60, "end": 150}) == "1-00–2-30", "section: file-name label"
+    assert util._expected_duration({"duration": 300, "options": {"section": {"start": 60, "end": None}}}) == 240, \
         "section: expected length"
 
 
@@ -427,13 +428,13 @@ BAD_SECTIONS = [{"start": "abc"}, {"start": "2:00", "end": "1:00"}]
 @pytest.mark.parametrize("bad", BAD_SECTIONS, ids=[f"section: rejects {b}" for b in BAD_SECTIONS])
 def test_section_rejects(bad):
     with pytest.raises(ValueError):
-        M._parse_section(bad)
+        util._parse_section(bad)
 
 
 @pytest.mark.slow
 def test_sponsorblock_and_parts_downloads(mgr, net, out, opts, fake, monkeypatch):
     # real downloads with SponsorBlock (patched: no internet) and with a part
-    monkeypatch.setattr(M.SponsorBlockPP, "EXTRACTORS", {**M.SponsorBlockPP.EXTRACTORS, "Test": "YouTube"})
+    monkeypatch.setattr(formats.SponsorBlockPP, "EXTRACTORS", {**formats.SponsorBlockPP.EXTRACTORS, "Test": "YouTube"})
     segments = {"mode": "fail"}
 
     def fake_segments(self, video_id, service):
@@ -442,7 +443,7 @@ def test_sponsorblock_and_parts_downloads(mgr, net, out, opts, fake, monkeypatch
         return [{"segment": [5.0, 10.0], "category": "sponsor", "UUID": "u1", "videoDuration": 30,
                  "actionType": "skip", "description": ""}]
 
-    monkeypatch.setattr(M.SponsorBlockPP, "_get_sponsor_segments", fake_segments)
+    monkeypatch.setattr(formats.SponsorBlockPP, "_get_sponsor_segments", fake_segments)
     j10 = make_job(mgr, out, "ten", ["sb1", "sb2", "part1"])
     it10 = items_of(j10)
     try:
@@ -485,14 +486,14 @@ def test_size_estimate(mgr, j6, tmp_path, monkeypatch):
     made = []
     with monkeypatch.context() as mp:
         mp.setattr(Path, "mkdir", lambda self, *a, **k: made.append(self))
-        d = M._disk_free(str(tmp_path / "not" / "there" / "yet"))
+        d = files._disk_free(str(tmp_path / "not" / "there" / "yet"))
     assert d["free"] > 0 and not made and not (tmp_path / "not").exists(), \
         f"disk free: nearest existing folder, nothing created: {d}"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="external drives are under /Volumes on macOS")
 def test_disk_free_unplugged_drive():
-    assert M._disk_free("/Volumes/NoSuchDrive123/x")["problem"], "disk free: unplugged drive reported"
+    assert files._disk_free("/Volumes/NoSuchDrive123/x")["problem"], "disk free: unplugged drive reported"
 
 
 @pytest.fixture(scope="module")
@@ -508,7 +509,7 @@ def subs(mgr, out, opts):
                            "extractor": "Test"} for i, v in enumerate(ids)]}
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(M, "inspect_url", fake_inspect)
+    mp.setattr(extract, "inspect_url", fake_inspect)
     js = mgr.open_url("test://list-subs")
     jsub = mgr.jobs[js["id"]]
     with mgr.cond:
@@ -591,7 +592,7 @@ def test_add_many_links(mgr, monkeypatch):
                 "items": [{"index": 1, "id": vid, "title": f"Single {vid}", "url": url, "duration": 30,
                            "extractor": "Test"}]}
 
-    monkeypatch.setattr(M, "inspect_url", fake_inspect_many)
+    monkeypatch.setattr(extract, "inspect_url", fake_inspect_many)
     res = mgr.open_many(["https://x.test/m1", "not a link", "https://x.test/m1", "https://x.test/broken",
                          "https://x.test/m2"])
     assert res["total"] == 3, f"import: links cleaned and de-duplicated: {res}"
@@ -604,7 +605,7 @@ def test_add_many_links(mgr, monkeypatch):
 def test_ytdlp_update(mgr, monkeypatch):
     # no network: command and version lookup replaced
     info = mgr.ytdlp_info()
-    assert info["version"] == M.yt_dlp.version.__version__, "ytdlp: version reported"
+    assert info["version"] == ytdlp.yt_dlp.version.__version__, "ytdlp: version reported"
     monkeypatch.setattr(mgr, "_update_cmd", lambda: [sys.executable, "-c", "print('updated')"], raising=False)
     monkeypatch.setattr(mgr, "_installed_ytdlp", lambda: "2099.01.01", raising=False)
     mgr.update_ytdlp()
@@ -650,7 +651,7 @@ def test_backfill_events(lib2, good):
 
 
 def expected(st):
-    return "queued" if st in M.ACTIVE else st
+    return "queued" if st in config.ACTIVE else st
 
 
 @pytest.mark.slow
@@ -753,12 +754,12 @@ def test_settings_round_trip(lib2, tmp):
     m2 = lib2
     before = dict(m2.settings)
     values = {"output_dir": str(tmp / "elsewhere"), **SETTING_VALUES}
-    assert set(values) == set(M.DEFAULT_SETTINGS), \
-        f"settings: the round-trip covers every setting: {set(M.DEFAULT_SETTINGS) ^ set(values)}"
-    assert all(values[k] != M.DEFAULT_SETTINGS[k] for k in values), "settings: every test value differs from its default"
+    assert set(values) == set(settings.DEFAULT_SETTINGS), \
+        f"settings: the round-trip covers every setting: {set(settings.DEFAULT_SETTINGS) ^ set(values)}"
+    assert all(values[k] != settings.DEFAULT_SETTINGS[k] for k in values), "settings: every test value differs from its default"
     try:
         saved = m2.update_settings(values)
-        reread = M._coerce_settings(json.loads(M.SETTINGS_FILE.read_text()))
+        reread = settings._coerce_settings(json.loads(config.SETTINGS_FILE.read_text()))
         assert saved == values and reread == values, "settings: every value saved and read back unchanged: " \
             f"{ {k: (saved.get(k), reread.get(k)) for k in values if saved.get(k) != values[k] or reread.get(k) != values[k]} }"
         assert m2.overview()["settings"]["notify"] is True, "settings: sent to the page"
@@ -779,7 +780,7 @@ BAD_COOKIES = {"cookies file: refuses not cookies.txt": "hello, these are not co
 def test_cookies_file_refused(lib2, text):
     with pytest.raises(ValueError):
         lib2.import_cookies(text)
-    assert not M._cookie_file().exists()
+    assert not cookies._cookie_file().exists()
 
 
 @pytest.mark.slow
@@ -791,11 +792,11 @@ def test_cookies_file(lib2, monkeypatch):
     st = m2.import_cookies(NETSCAPE)
     assert st.get("youtube") == 2 and st.get("count") == 3 and st.get("signed_in") \
         and m2.overview()["cookie_file"]["youtube"] == 2, f"cookies file: imported with counts: {st}"
-    assert (M._cookie_file().stat().st_mode & 0o077) == 0, \
-        f"cookies file: readable only by the user: {oct(M._cookie_file().stat().st_mode)}"
+    assert (cookies._cookie_file().stat().st_mode & 0o077) == 0, \
+        f"cookies file: readable only by the user: {oct(cookies._cookie_file().stat().st_mode)}"
     assert m2.hold is None and not m2.rate_probe, f"cookies file: importing ends the rate-limit pause at once: {m2.hold}"
     seen = []
-    real_ydl = M.yt_dlp.YoutubeDL
+    real_ydl = ytdlp.yt_dlp.YoutubeDL
 
     class SpyYDL(real_ydl):
         def __init__(self, params=None, *a, **k):
@@ -803,15 +804,15 @@ def test_cookies_file(lib2, monkeypatch):
             super().__init__(params, *a, **k)
 
     with monkeypatch.context() as mp:
-        mp.setattr(M.yt_dlp, "YoutubeDL", SpyYDL)
-        opts = M._base_opts({"cookies_browser": "chrome"})
-        with M._ytdl(opts) as y1, M._ytdl(opts) as y2:
+        mp.setattr(ytdlp.yt_dlp, "YoutubeDL", SpyYDL)
+        opts = ytdlp._base_opts({"cookies_browser": "chrome"})
+        with ytdlp._ytdl(opts) as y1, ytdlp._ytdl(opts) as y2:
             paths = [y1.params.get("cookiefile"), y2.params.get("cookiefile")]
             copies_ok = all(p and Path(p).read_text() == NETSCAPE for p in paths)
-    assert paths[0] != paths[1] and copies_ok and all(p != str(M._cookie_file()) for p in paths), \
+    assert paths[0] != paths[1] and copies_ok and all(p != str(cookies._cookie_file()) for p in paths), \
         f"cookies file: each download gets its own copy (yt-dlp writes cookies back): {paths}"
     assert all("cookiesfrombrowser" not in s for s in seen), f"cookies file: used instead of the browser's cookies: {seen}"
     assert not any(Path(p).exists() for p in paths), "cookies file: copies removed afterwards"
     assert "SAPISID" not in json.dumps(m2.export_data()), "cookies file: never in the data export"
-    assert m2.remove_cookies() and not M._cookie_file().exists() and m2.overview()["cookie_file"] is None, \
+    assert m2.remove_cookies() and not cookies._cookie_file().exists() and m2.overview()["cookie_file"] is None, \
         "cookies file: removed"

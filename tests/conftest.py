@@ -16,12 +16,12 @@ os.environ["YTDL_DATA_DIR"] = str(SCRATCH / "data")
 (SCRATCH / "data").mkdir()          # app.log lives here for the whole run (one log handler per process)
 sys.path.insert(0, str(ROOT / "backend"))
 
-from ytdl import manager as M  # noqa: E402
+from ytdl import config  # noqa: E402
 
 from helpers import (FakeExtractor, Flaky, MediaServer, Net, ff, new_manager, restore_paths,  # noqa: E402
                      stop_manager, use_data_dir)
 
-if M.DATA_DIR.resolve() == (ROOT / "data").resolve():
+if config.DATA_DIR.resolve() == (ROOT / "data").resolve():
     raise SystemExit("Refusing to run: the tests would use the real library in data/")
 
 
