@@ -57,7 +57,8 @@ def test_youtube_blocked(monkeypatch, up, down):
     m, _ = monitor(monkeypatch, up, down)
     assert wait(lambda: m.state.get("checked"), 20)
     assert m.state["level"] == "blocked" and "VPN" in m.state["advice"], m.state
-    assert m.state["youtube"]["error"] == "Connection refused"
+    # Windows retries a refused local connection until the timeout, so it may report that instead
+    assert m.state["youtube"]["error"] in ("Connection refused", "Timed out"), m.state["youtube"]
 
 
 def test_offline(monkeypatch, down):

@@ -242,7 +242,7 @@ class PipelineMixin:
             elif kind == "ratelimit":
                 # Downloads running together hit the block together: that is one wave, one strike. A download
                 # that started before the last strike doesn't count again.
-                new_wave = (item.get("started") or now) >= self.rate_wave
+                new_wave = (item.get("started") or now) > self.rate_wave   # ">": on Windows the clock moves in ~16 ms steps
                 if new_wave:
                     self.rate_strikes += 1
                     self.rate_wave = now

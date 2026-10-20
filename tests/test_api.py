@@ -291,7 +291,8 @@ def test_settings_route(api, mgr, netstub):
 
 
 def test_cookie_routes(api, mgr, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))            # an empty home: no real browser folders are read
+    for var in ("HOME", "LOCALAPPDATA", "APPDATA"):       # an empty home: no real browser folders are read
+        monkeypatch.setenv(var, str(tmp_path))
     assert api.get("/api/cookies/sources").json() == {"browsers": []}
     r = api.post("/api/cookies/test", json={"browser": " nosuch ", "profile": ""}).json()
     assert r["ok"] is False and "nosuch" in r["error"] and " nosuch " not in r["error"]

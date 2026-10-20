@@ -1,5 +1,6 @@
 """The guarantees in .claude/rules/download-core.md: the archive line only after verification, never the same
 video twice at once, nothing lost after a crash, deletes only for files whose last [id] tag matches."""
+import os
 import subprocess
 import sys
 import textwrap
@@ -156,7 +157,8 @@ def test_crash_loses_nothing_saved(tmp_path, make_manager):
     script = tmp_path / "crash.py"
     script.write_text(CRASH)
     r = subprocess.run([sys.executable, str(script), str(ROOT), "4.5"], env={"YTDL_DATA_DIR": str(data),
-                       "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}, capture_output=True, text=True, timeout=60)
+                       "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+                       **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {})}, capture_output=True, text=True, timeout=60)
     assert r.returncode == 9, r.stderr[-500:]
     m = make_manager(data)
     job = next(j for j in m.jobs.values() if j["url"] == "test://crash")

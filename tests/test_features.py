@@ -806,7 +806,7 @@ def test_cookies_file(lib2, monkeypatch):
     st = m2.import_cookies(NETSCAPE)
     assert st.get("youtube") == 2 and st.get("count") == 3 and st.get("signed_in") \
         and m2.overview()["cookie_file"]["youtube"] == 2, f"cookies file: imported with counts: {st}"
-    assert (cookies._cookie_file().stat().st_mode & 0o077) == 0, \
+    assert sys.platform == "win32" or (cookies._cookie_file().stat().st_mode & 0o077) == 0, \
         f"cookies file: readable only by the user: {oct(cookies._cookie_file().stat().st_mode)}"
     assert m2.hold is None and not m2.rate_probe, f"cookies file: importing ends the rate-limit pause at once: {m2.hold}"
     seen = []

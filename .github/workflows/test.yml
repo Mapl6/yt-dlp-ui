@@ -14,11 +14,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -33,7 +33,7 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
       - run: scripts/test.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: failure()
         with:
           name: playwright-${{ matrix.os }}
@@ -48,12 +48,14 @@ jobs:
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - run: choco install ffmpeg -y --no-progress
-      - run: |
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: Python tests
+        run: |
           python -m venv .venv
           .venv\Scripts\python -m pip install -q -r requirements-dev.txt
           .venv\Scripts\python -m pytest -q -n auto --dist loadfile
