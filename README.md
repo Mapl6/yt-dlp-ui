@@ -8,6 +8,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Mapl6/yt-dlp-ui/actions/workflows/test.yml"><img alt="Tests" src="https://github.com/Mapl6/yt-dlp-ui/actions/workflows/test.yml/badge.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="yt-dlp" src="https://img.shields.io/badge/powered%20by-yt--dlp-d93a32">
   <img alt="macOS and Linux" src="https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux-555">
@@ -47,7 +48,7 @@ You need **Python 3.10+**, **ffmpeg** and a JavaScript runtime for YouTube (deno
 
 ```bash
 brew install ffmpeg deno          # macOS (Linux: use your package manager)
-git clone <this repository> && cd <its folder>
+git clone https://github.com/Mapl6/yt-dlp-ui.git && cd yt-dlp-ui
 ./run.sh                          # sets everything up on first run, then opens http://127.0.0.1:8765
 ```
 
