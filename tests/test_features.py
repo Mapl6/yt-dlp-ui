@@ -18,6 +18,7 @@ from yt_dlp.utils import DownloadError
 
 from ytdl import config, cookies, extract, files, formats, settings, util, verify, ytdlp
 from ytdl import manager as M
+from ytdl.manager import updates
 from helpers import items_of, make_job, new_manager, restore_paths, stop_manager, use_data_dir, wait
 
 MB = 1024 * 1024
@@ -606,6 +607,19 @@ def test_ytdlp_update(mgr, monkeypatch):
     # no network: command and version lookup replaced
     info = mgr.ytdlp_info()
     assert info["version"] == ytdlp.yt_dlp.version.__version__, "ytdlp: version reported"
+    assert wait(lambda: not mgr.ytdlp_info()["checking"], 60), "ytdlp: the PyPI lookup finishes"
+    # offline: a failed lookup isn't repeated on every call (the Settings dialog asks every 1.5 s)
+    lookups = []
+
+    def offline(opts):
+        lookups.append(1)
+        raise OSError("offline")
+    monkeypatch.setattr(updates, "_ytdl", offline)
+    monkeypatch.setitem(mgr._latest, "checked", 0)
+    monkeypatch.setitem(mgr._latest, "failed", 0)
+    mgr.ytdlp_info()
+    assert wait(lambda: not mgr._latest["checking"], 10) and mgr._latest["failed"], "ytdlp: failed lookup recorded"
+    assert not mgr.ytdlp_info()["checking"] and lookups == [1], f"ytdlp: no new lookup right after a failed one: {lookups}"
     monkeypatch.setattr(mgr, "_update_cmd", lambda: [sys.executable, "-c", "print('updated')"], raising=False)
     monkeypatch.setattr(mgr, "_installed_ytdlp", lambda: "2099.01.01", raising=False)
     mgr.update_ytdlp()

@@ -199,3 +199,25 @@ test("export all data, then import it back", async ({ page }, info) => {
   await expect(back).toBeVisible();
   await expect(back).toContainText("5 / 5 downloaded", { timeout: 60_000 });
 });
+
+test("show a finished video in its playlist, even when the card is closed", async ({ page }) => {
+  await page.getByLabel("YouTube link").fill("https://e2e.test/list/delta/40");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  const id = await jobId(page, "List delta");
+  await api(page, `/api/jobs/${id}/download`, { method: "POST", data: { ids: ["delta35"], options: { quality: "best" } } });
+  await expect.poll(async () => (await api(page, `/api/jobs/${id}/items`)).items.find((i) => i.id === "delta35").status,
+    { timeout: 60_000 }).toBe("done");
+  // the card closed (not built yet), the Activity panel open on Recently finished
+  await page.evaluate(() => { localStorage.setItem("expanded", "[]"); localStorage.setItem("dashOpen", "true"); localStorage.setItem("dashTab", '"recent"'); });
+  await page.reload();
+  const c = card(page, "List delta");
+  const row = page.locator(".dash-row", { hasText: "Video delta35" }).first();
+  await row.getByRole("button", { name: "List delta" }).click();
+  await expect(c.getByText("Video delta35", { exact: true })).toBeVisible();   // row 35: only drawn once scrolled to
+
+  // a tab that hides the video is cleared
+  await c.getByRole("button", { name: /^Failed/ }).click();
+  await expect(c.getByText("Video delta35", { exact: true })).toHaveCount(0);
+  await row.getByRole("button", { name: "List delta" }).click();
+  await expect(c.getByText("Video delta35", { exact: true })).toBeVisible();
+});

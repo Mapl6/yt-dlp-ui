@@ -184,8 +184,9 @@ def on_started(smoke: bool):
     if smoke:
         time.sleep(4)
         title = state["window"].evaluate_js("document.title")
-        rows = state["window"].evaluate_js("document.querySelectorAll('.dash-stats b').length")
-        print(f"SMOKE page title={title!r} dashboard tiles={rows} status item={'yes' if state['status'] else 'no'}")
+        # parts drawn whether or not anything downloads (the Activity tiles only show while it's open)
+        parts = state["window"].evaluate_js("document.querySelectorAll('#net-card, #dash, #jobs').length")
+        print(f"SMOKE page title={title!r} page parts={parts}/3 status item={'yes' if state['status'] else 'no'}")
         quit_app()
 
 

@@ -3,7 +3,7 @@
 // event log, and History & stats.
 import { memo, useEffect, useRef, useState } from "react";
 import { api, itemUrl } from "../lib/api";
-import { fileName, fmtAgo, fmtBytes, fmtLong, fmtSpeed, fmtTime, plural, store } from "../lib/util";
+import { fileName, fmtAgo, fmtBytes, fmtLong, fmtSpeed, fmtTime, mergeEvents, plural, store } from "../lib/util";
 import { useApp } from "./AppContext";
 import { LineChart } from "./charts";
 import { Detail } from "./Detail";
@@ -61,14 +61,15 @@ export function Dashboard({ tab, setTab }: { tab: string; setTab: (t: string) =>
   // the rows of the current tab; the event log isn't filtered by the server, so Recently finished is filtered here
   const ql = q.trim().toLowerCase();
   let rows: any[] = tab === "stats" ? [] : d[tab] || [];
+  // every event loaded so far, before the filter: the next page starts after these
+  const loaded = tab === "recent" ? mergeEvents(d.recent, extra) : [];
   if (tab === "recent") {
-    const seen = new Set(d.recent.map((r: any) => r.event));
-    rows = d.recent.concat(extra.filter((r) => !seen.has(r.event))).filter((r: any) => (!job || r.job === job)
+    rows = loaded.filter((r: any) => (!job || r.job === job)
       && (!ql || r.title.toLowerCase().includes(ql) || (r.job_title || "").toLowerCase().includes(ql)));
   }
   const counts: Record<string, number> = { active: d.active.length, queue: d.queued, recent: d.recent.length };
   const more = tab === "queue" ? d.queued - d.queue.length : 0;
-  const canPage = tab === "recent" && (extraTotal === null ? d.recent.length >= 30 : rows.length < extraTotal);
+  const canPage = tab === "recent" && (extraTotal === null ? d.recent.length >= 30 : loaded.length < extraTotal);
   const hist: number[] = st.speed_history || [];
 
   const toggleRow = (key: string) => setOpen((s) => { const n = new Set(s); n.has(key) ? n.delete(key) : n.add(key); return n; });
@@ -76,7 +77,7 @@ export function Dashboard({ tab, setTab }: { tab: string; setTab: (t: string) =>
   async function loadMore() {
     setLoadingMore(true);
     try {
-      const res = await api(`/api/history?offset=${rows.length}&limit=30`);
+      const res = await api(`/api/history?offset=${loaded.length}&limit=30`);
       setExtra((x) => x.concat(res.rows));
       setExtraTotal(res.total);
     } catch (err: any) { toast(err.message); }

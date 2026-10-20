@@ -21,6 +21,13 @@ describe("links", () => {
   it("links: none", () => expect(U.parseUrls("no links here")).toHaveLength(0));
 });
 
+describe("recently finished", () => {
+  const ev = (...ids) => ids.map((event) => ({ event }));
+  it("pages: newest first, each event once even when pages overlap", () =>
+    expect(U.mergeEvents(ev(9, 8, 7), ev(7, 6, 6, 5)).map((r) => r.event)).toEqual([9, 8, 7, 6, 5]));
+  it("pages: nothing loaded yet", () => expect(U.mergeEvents(ev(3), [])).toEqual(ev(3)));
+});
+
 describe("formatters", () => {
   it("format: bytes", () => {
     expect(U.fmtBytes(1536)).toBe("2 KB");

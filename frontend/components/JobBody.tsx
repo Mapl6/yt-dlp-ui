@@ -1,7 +1,7 @@
 "use client";
 // The body of an open playlist card: download options (and the playlist's Save button), automatic checks,
 // selection, tabs and filters, the video list, and the file tools.
-import { forwardRef, memo, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { DOWNLOADED, IN_QUEUE, SELECTABLE, TABS, UNAVAILABLE, visibleItems } from "../lib/filters";
 import type { Item, Job } from "../lib/types";
@@ -14,7 +14,8 @@ import { VirtualList, type VirtualListApi } from "./VirtualList";
 const ROW_HEIGHT = 60;
 const DEFAULT_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144];
 
-export interface JobBodyApi { reveal: (itemId: string) => void }
+/** "Show this video": n changes on every request, so asking for the same video again scrolls to it again. */
+export interface RevealRequest { item: string; n: number }
 
 interface Form {
   quality: string; container: string; output_dir: string; sponsorblock: string; sec_start: string; sec_end: string;
@@ -57,7 +58,7 @@ function checkSummary(c: NonNullable<Job["check"]>) {
   return bits.join(", ");
 }
 
-export const JobBody = forwardRef<JobBodyApi, { job: Job; open: boolean }>(function JobBody({ job: j, open }, ref) {
+export function JobBody({ job: j, open, reveal }: { job: Job; open: boolean; reveal: RevealRequest | null }) {
   const { overview, refresh, toast, itemAction, openMenu } = useApp();
   const [form, setForm] = useState<Form>(() => initialForm(j, overview?.settings || {}));
   const [savedOpts, setSavedOpts] = useState(() => optionsKey(form));
@@ -103,8 +104,16 @@ export const JobBody = forwardRef<JobBodyApi, { job: Job; open: boolean }>(funct
     if (changed) setSelected(next);
   }, [version]);   // eslint-disable-line react-hooks/exhaustive-deps
 
+  // a video to show: wait until it is loaded, and clear the tab and filters if they hide it
   const vlist = useRef<VirtualListApi>(null);
-  useImperativeHandle(ref, () => ({ reveal: (id) => vlist.current?.reveal(id) }), []);
+  const [revealing, setRevealing] = useState<string | null>(null);
+  useEffect(() => { if (reveal) setRevealing(reveal.item); }, [reveal?.n]);   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!revealing || !open || !items.current.has(revealing)) return;
+    if (!list.some((it) => it.id === revealing)) { setTab("all"); setText(""); setDur("any"); return; }
+    vlist.current?.reveal(revealing);
+    setRevealing(null);
+  }, [revealing, open, list]);
 
   const audio = AUDIO.includes(form.quality);
   const changed = optionsKey(form) !== savedOpts;
@@ -176,13 +185,18 @@ export const JobBody = forwardRef<JobBodyApi, { job: Job; open: boolean }>(funct
   });
 
   async function saveSync(every: string, auto: boolean) {
+    const before = [syncEvery, syncAuto] as const;
     setSyncEvery(every);
     setSyncAuto(auto);
     try {
       await api(`/api/jobs/${j.id}/sync`, { method: "PUT", body: { every_hours: Number(every), auto_download: auto } });
       toast(Number(every) ? `Checking for new videos ${SYNC_LABEL[every]}${auto ? " and downloading them" : ""}` : "Automatic checks turned off");
       refresh();
-    } catch (err: any) { toast(err.message); }
+    } catch (err: any) {
+      setSyncEvery(before[0]);                      // not saved: show what the playlist still uses
+      setSyncAuto(before[1]);
+      toast(err.message);
+    }
   }
 
   const tools = (role: string) => run(role, async () => {
@@ -345,7 +359,7 @@ export const JobBody = forwardRef<JobBodyApi, { job: Job; open: boolean }>(funct
       </div>
     </div>
   );
-});
+}
 
 function Check({ label, on, set }: { label: string; on: boolean; set: (v: boolean) => void }) {
   return <label><input type="checkbox" checked={on} onChange={(e) => set(e.target.checked)} /> {label}</label>;

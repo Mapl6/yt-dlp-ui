@@ -6,7 +6,7 @@ import { api } from "../lib/api";
 import type { Job } from "../lib/types";
 import { fmtSpeed, plural, store } from "../lib/util";
 import { useApp } from "./AppContext";
-import { JobBody, type JobBodyApi } from "./JobBody";
+import { JobBody, type RevealRequest } from "./JobBody";
 import { JOB_LABEL, SYNC_LABEL } from "./labels";
 
 export interface LibraryApi { openJob: (id: string, itemId?: string | null) => void; markExpanded: (id: string) => void }
@@ -15,8 +15,10 @@ export const Library = forwardRef<LibraryApi>(function Library(_, ref) {
   const { overview } = useApp();
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState("");
-  const cards = useRef(new Map<string, { el: HTMLDivElement | null; body: JobBodyApi | null }>());
-  const [scrollTo, setScrollTo] = useState<{ id: string; itemId: string | null } | null>(null);
+  const cards = useRef(new Map<string, HTMLDivElement>());
+  const [scrollTo, setScrollTo] = useState<string | null>(null);
+  // a video to show: handed to its card, which waits until the video is loaded (the card may not be built yet)
+  const [reveal, setReveal] = useState<(RevealRequest & { job: string }) | null>(null);
 
   // the open cards are remembered in this browser
   useEffect(() => { setExpanded(new Set(store.get<string[]>("expanded", []))); }, []);
@@ -28,15 +30,18 @@ export const Library = forwardRef<LibraryApi>(function Library(_, ref) {
   useImperativeHandle(ref, () => ({
     markExpanded,
     /** Open a playlist's card (if needed) and scroll to it; optionally highlight one video. */
-    openJob(id, itemId = null) { markExpanded(id); setScrollTo({ id, itemId }); },
+    openJob(id, itemId = null) {
+      markExpanded(id);
+      setScrollTo(id);
+      if (itemId) setReveal((r) => ({ job: id, item: itemId, n: (r?.n || 0) + 1 }));
+    },
   }));
 
   useEffect(() => {
     if (!scrollTo) return;
-    const card = cards.current.get(scrollTo.id);
-    if (!card?.el) return;
-    card.el.scrollIntoView({ behavior: "smooth", block: "start" });
-    if (scrollTo.itemId) card.body?.reveal(scrollTo.itemId);
+    const el = cards.current.get(scrollTo);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
     setScrollTo(null);
   }, [scrollTo, expanded]);
 
@@ -50,11 +55,11 @@ export const Library = forwardRef<LibraryApi>(function Library(_, ref) {
       </div>
       <div id="jobs">
         {overview && !jobs.length && <p className="empty">Nothing saved yet. Paste a playlist link above.</p>}
-        {!overview && <p className="empty">Nothing saved yet. Paste a playlist link above.</p>}
+        {!overview && <p className="empty">Loading your playlists…</p>}
         {jobs.map((j) => (
           <JobCard key={j.id} job={j} open={expanded.has(j.id)} hidden={!!q && !j.title.toLowerCase().includes(q)}
-            onToggle={() => toggle(j.id)} onRemoved={() => forget(j.id)}
-            register={(el, body) => { if (el || body) cards.current.set(j.id, { el, body }); else cards.current.delete(j.id); }} />
+            reveal={reveal?.job === j.id ? reveal : null} onToggle={() => toggle(j.id)} onRemoved={() => forget(j.id)}
+            register={(el) => { if (el) cards.current.set(j.id, el); else cards.current.delete(j.id); }} />
         ))}
       </div>
     </section>
@@ -62,20 +67,19 @@ export const Library = forwardRef<LibraryApi>(function Library(_, ref) {
 });
 
 interface CardProps {
-  job: Job; open: boolean; hidden: boolean;
+  job: Job; open: boolean; hidden: boolean; reveal: RevealRequest | null;
   onToggle: () => void; onRemoved: () => void;
-  register: (el: HTMLDivElement | null, body: JobBodyApi | null) => void;
+  register: (el: HTMLDivElement | null) => void;
 }
 
-function JobCard({ job: j, open, hidden, onToggle, onRemoved, register }: CardProps) {
+function JobCard({ job: j, open, hidden, reveal, onToggle, onRemoved, register }: CardProps) {
   const { refresh, toast, confirmRemove } = useApp();
   const el = useRef<HTMLDivElement>(null);
-  const body = useRef<JobBodyApi>(null);
   const [built, setBuilt] = useState(open);            // the body is built the first time the card opens
   const [refreshing, setRefreshing] = useState(false);
   const [imgOk, setImgOk] = useState(true);
   useEffect(() => { if (open) setBuilt(true); }, [open]);
-  useEffect(() => { register(el.current, body.current); return () => register(null, null); });
+  useEffect(() => { register(el.current); return () => register(null); });
 
   const c = j.counts;
   const busy = c.queued + c.downloading + c.processing > 0;
@@ -131,7 +135,7 @@ function JobCard({ job: j, open, hidden, onToggle, onRemoved, register }: CardPr
           </button>
         </div>
       </div>
-      {built && <JobBody ref={body} job={j} open={open} />}
+      {built && <JobBody job={j} open={open} reveal={reveal} />}
     </div>
   );
 }

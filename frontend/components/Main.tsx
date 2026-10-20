@@ -134,8 +134,10 @@ export default function Main() {
         const busy = (a.overview?.jobs || []).filter((j) => j.counts.queued + j.counts.downloading + j.counts.processing > 0);
         if (!busy.length) return a.toast("Nothing is downloading");
         const resume = busy.every((j) => j.paused);
-        await api(`/api/queue/${resume ? "resume-all" : "pause-all"}`, { method: "POST" }).catch((err) => a.toast(err.message));
-        a.toast(resume ? "Resumed" : "Paused every playlist");
+        try {
+          await api(`/api/queue/${resume ? "resume-all" : "pause-all"}`, { method: "POST" });
+          a.toast(resume ? "Resumed" : "Paused every playlist");
+        } catch (err: any) { a.toast(err.message); }
         a.refresh();
       }
     };

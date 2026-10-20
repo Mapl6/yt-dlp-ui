@@ -89,7 +89,7 @@ class Manager(PersistenceMixin, OptionsMixin, CoreMixin, QueueMixin, LibraryMixi
         self.importing: dict | None = None             # progress of "add many links"
         self._disk_cache: dict[str, tuple] = {}        # folder -> (time, _disk_free result)
         self.updating: dict | None = None              # progress of a yt-dlp update
-        self._latest = {"version": None, "checked": 0, "checking": False}   # newest yt-dlp on PyPI
+        self._latest = {"version": None, "checked": 0, "checking": False, "failed": 0}   # newest yt-dlp on PyPI
         shutil.rmtree(config.DATA_DIR / ".cookies-tmp", ignore_errors=True)   # copies left by a crash
         self.store = Store(config.DB_FILE, config.DB_BACKUP)
         self._load_state()

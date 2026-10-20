@@ -79,7 +79,7 @@ export const SettingsDialog = forwardRef<SettingsApi>(function SettingsDialog(_,
         const y = await api("/api/ytdlp");
         if (!live) return;
         setYtdlp(y);
-        if (y.update?.running || !y.latest) timer = setTimeout(load, 1500);
+        if (y.update?.running || y.checking) timer = setTimeout(load, 1500);
       } catch (err: any) { if (live) setYtdlp({ error: err.message }); }
     };
     loadYtdlp.current = load;
@@ -228,7 +228,8 @@ export const SettingsDialog = forwardRef<SettingsApi>(function SettingsDialog(_,
   const ytState = ytdlp?.error ? ytdlp.error : u?.running ? "Updating…"
     : u?.restart ? `Version ${u.installed} is installed — restart to use it`
     : u?.ok === false ? "The update failed — see the details below"
-    : newer ? `Version ${ytdlp.latest} is available` : ytdlp?.latest ? "Up to date" : "Checking for updates…";
+    : newer ? `Version ${ytdlp.latest} is available` : ytdlp?.latest ? "Up to date"
+    : ytdlp?.checking ? "Checking for updates…" : "Couldn't check for updates (offline?)";
   const ytCls = u?.ok === false ? "s-failed" : newer || u?.restart ? "s-pausing" : "s-done";
 
   return (

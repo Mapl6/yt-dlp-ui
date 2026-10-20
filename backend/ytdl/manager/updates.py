@@ -11,7 +11,7 @@ import time
 
 import yt_dlp
 
-from ..config import YTDLP_CHECK_EVERY, log
+from ..config import YTDLP_CHECK_EVERY, YTDLP_RETRY_AFTER, log
 from ..errors import _clean_error
 from ..ytdlp import _base_opts, _ytdl
 
@@ -22,14 +22,18 @@ class UpdatesMixin:
     def ytdlp_info(self) -> dict:
         """The yt-dlp version in use, and the newest one on PyPI (looked up in the background, cached)."""
         with self.cond:
-            stale = time.time() - self._latest["checked"] > YTDLP_CHECK_EVERY and not self._latest["checking"]
+            now, latest = time.time(), self._latest
+            # after a failed lookup (offline), wait a while instead of asking PyPI again on every call
+            stale = not latest["checking"] and now - latest["checked"] > YTDLP_CHECK_EVERY \
+                and now - latest["failed"] > YTDLP_RETRY_AFTER
             if stale:
-                self._latest["checking"] = True
+                latest["checking"] = True
         if stale:
             threading.Thread(target=self._check_latest, name="ytdlp-latest", daemon=True).start()
         with self.cond:
             return {"version": yt_dlp.version.__version__, "latest": self._latest["version"],
-                    "checked": self._latest["checked"] or None, "update": dict(self.updating) if self.updating else None}
+                    "checked": self._latest["checked"] or None, "checking": self._latest["checking"],
+                    "update": dict(self.updating) if self.updating else None}
 
     def _check_latest(self):
         version = None
@@ -40,7 +44,9 @@ class UpdatesMixin:
         except Exception as exc:
             log.info("Couldn't check for a newer yt-dlp: %s", _clean_error(exc))
         with self.cond:
-            self._latest.update(checking=False, checked=time.time() if version else 0, version=version or self._latest["version"])
+            now = time.time()
+            self._latest.update(checking=False, checked=now if version else self._latest["checked"],
+                                failed=0 if version else now, version=version or self._latest["version"])
             self.version += 1
 
     def _update_cmd(self) -> list[str]:

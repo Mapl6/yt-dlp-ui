@@ -36,6 +36,7 @@ ACTIVE = {"downloading", "processing"}
 SYNC_TICK = 60           # seconds between checks for playlists due an automatic refresh
 SYNC_CHOICES = (0, 6, 12, 24, 168)                # hours between automatic refreshes (0 = off)
 YTDLP_CHECK_EVERY = 6 * 3600
+YTDLP_RETRY_AFTER = 600  # after a failed lookup of the newest yt-dlp (offline)
 
 
 CHECK_WORKERS = 3        # files verified in parallel by "Check files"

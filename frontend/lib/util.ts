@@ -75,6 +75,16 @@ export function titleFor(active?: { total?: number; downloaded?: number }[]): st
   return `↓${active.length}${total ? ` · ${Math.floor((100 * done) / total)}%` : ""} — YT Downloader`;
 }
 
+/**
+ * Recently finished: the newest events (pushed live) followed by the older pages loaded with "Show more", each
+ * event once. New events push older ones into the next page, so pages can overlap.
+ */
+export function mergeEvents<T extends { event: number }>(recent: T[], older: T[]): T[] {
+  const seen = new Set<number>(), out: T[] = [];
+  for (const r of [...recent, ...older]) if (!seen.has(r.event)) { seen.add(r.event); out.push(r); }
+  return out;
+}
+
 /** Compare versions by their numbers: "2026.10.3" is newer than "2026.08.19" (PyPI drops the zeros). */
 export function isNewer(a?: string | null, b?: string | null): boolean {
   if (!a || !b) return false;

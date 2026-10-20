@@ -123,9 +123,14 @@ def test_network_failure_counters(mgr, job, it):
     mgr._handle_failure(j, it, Exception("Unable to download video data: <urlopen error timed out>"))
     assert it["status"] == "queued" and it["attempts"] == 0 and it["net_attempts"] == 1 and it["next_try"] > time.time(), \
         f"net failure: re-queued with backoff, normal attempts untouched: {it['error']}"
+    rev = j["rev"]
     mgr.network_changed("offline", "good")
-    assert it["next_try"] == 0, "net restored: backoff cleared"
+    assert it["next_try"] == 0 and it["rev"] > rev, "net restored: backoff cleared and published"
     it.update(status="downloading")
+    mgr._handle_failure(j, it, Exception("Unable to download video data: <urlopen error timed out>"))
+    mgr.network_changed("checking", "good")
+    assert it["next_try"] == 0, "net restored after a failed connection check: backoff cleared too"
+    it.update(status="downloading", net_attempts=1)
     try:
         mgr._handle_failure(j, it, Exception("HTTP Error 429: Too Many Requests"))
         assert mgr.hold and mgr.hold["until"] > time.time(), f"rate limit: whole queue held: {mgr.waiting_reason()}"

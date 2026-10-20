@@ -64,12 +64,16 @@ class QueueMixin:
     def network_changed(self, old: str, new: str):
         """Called by the connection monitor. When the connection comes back, retry waiting videos at once."""
         log.info("Connection: %s -> %s", old, new)
-        if new in LIVE_LEVELS and old not in LIVE_LEVELS and old != "checking":
+        # "checking" counts as down too: a failed connection check reports it, and at startup nothing waits anyway
+        if new in LIVE_LEVELS and old not in LIVE_LEVELS:
             with self.cond:
                 for job in self.jobs.values():
-                    for it in job["items"]:
-                        if it["status"] == "queued" and it.get("net_attempts") and it["next_try"] > time.time():
-                            it["next_try"] = 0
+                    waiting = [it for it in job["items"] if it["status"] == "queued" and it.get("net_attempts")
+                               and it["next_try"] > time.time()]
+                    for it in waiting:
+                        it.update(next_try=0, rev=job["rev"] + 1)
+                    if waiting:
+                        self._touch(job)
                 self.cond.notify_all()
         with self.cond:
             self.version += 1
