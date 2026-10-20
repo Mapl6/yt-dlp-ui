@@ -246,7 +246,7 @@ const DashRow = memo(function DashRow({ rowKey, r, pos, tab, expanded, dragging,
       {r.progress > 0 && r.progress < 100 ? ` · ${r.progress.toFixed(0)}% already downloaded` : ""}
       {r.duration ? ` · ${fmtTime(r.duration)}` : ""}
     </>;
-    const waitingRetry = r.next_try && r.next_try > Date.now() / 1000;
+    const waitingRetry = !!r.next_try && r.next_try > Date.now() / 1000;   // a bare 0 would be drawn as "0"
     right = <>
       {waitingRetry && <button className="small" data-dact="now" disabled={busy === "now"} onClick={(e) => { e.stopPropagation(); act("now"); }}>Try now</button>}
       {icon("top", "Move to top", TOP)}{icon("bottom", "Move to bottom", BOTTOM)}
