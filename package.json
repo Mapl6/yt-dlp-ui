@@ -7,7 +7,8 @@
     "build": "next build frontend",
     "dev": "next dev frontend --port 3000",
     "test:ui": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "screenshots": "node scripts/screenshots/shoot.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",

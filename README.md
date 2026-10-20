@@ -1,16 +1,62 @@
-# YT Downloader
+<p align="center">
+  <img src="docs/images/banner.png" alt="YT Downloader: whole playlists, every file verified" width="100%">
+</p>
 
-A local web app for downloading YouTube videos, playlists, and channels with yt-dlp.
+<p align="center">
+  <b>A local YouTube downloader for whole playlists and channels.</b><br>
+  It keeps going on a weak connection, and it never counts a broken file as downloaded.
+</p>
 
-## Start
+<p align="center">
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="yt-dlp" src="https://img.shields.io/badge/powered%20by-yt--dlp-d93a32">
+  <img alt="macOS and Linux" src="https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux-555">
+  <img alt="Runs locally" src="https://img.shields.io/badge/runs-100%25%20locally-2ea44f">
+</p>
+
+---
+
+Save a playlist (or a channel, or a single video) to your library, then pick which videos to download, when you like. The app sits in your browser at `http://127.0.0.1:8765`, keeps a queue across restarts, and checks every file before it calls it done.
+
+## Why it exists
+
+Downloading a 300-video playlist over a flaky connection usually ends in half-finished files, duplicates and no idea what's missing. YT Downloader is built around that case:
+
+- **Nothing is lost when the connection drops.** Downloads resume from the same byte, even after a restart. While you're offline the queue waits, then carries on by itself.
+- **No damaged file ever counts as downloaded.** Every stream is size-checked. Every file's length is compared with the video's, and its last seconds are decoded. A bad merge is redone from the kept streams.
+- **Your playlist stays in sync.** Add the link again (or let it check every few hours) and only new videos are added. File numbers never shift.
+- **It's gentle with YouTube.** Rate limiting and "confirm you're not a bot" pause the whole queue in waves instead of burning through retries, and cookies from your browser or a `cookies.txt` fix it in one click.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/overview.png" alt="The app: connection panel, live Activity dashboard with three downloads, and the playlist library" width="100%">
+</p>
+
+| A playlist: choose videos, quality and options | The queue: drag to reorder, pause one video |
+|---|---|
+| <img src="docs/images/playlist.png" alt="An open playlist with download options, a range selection and videos in every state"> | <img src="docs/images/queue.png" alt="Up next: the queue in the order it will download"> |
+| **History & stats: data per day, success rate, why downloads failed** | **Dark mode follows your system** |
+| <img src="docs/images/stats.png" alt="History and statistics for the last 30 days"> | <img src="docs/images/overview-dark.png" alt="The app in dark mode"> |
+
+<sub>The screenshots show a made-up demo library (`npm run screenshots`). Use the app only for content you have the right to download.</sub>
+
+## Quick start
+
+You need **Python 3.10+**, **ffmpeg** and a JavaScript runtime for YouTube (deno is recommended; node or bun also work).
 
 ```bash
-./run.sh            # opens http://127.0.0.1:8765 in your browser
-./run-mac.sh        # optional: the same app in its own Mac window, with a menu-bar icon
-run.bat             # Windows (or: powershell -ExecutionPolicy Bypass -File run.ps1)
+brew install ffmpeg deno          # macOS (Linux: use your package manager)
+git clone <this repository> && cd <its folder>
+./run.sh                          # sets everything up on first run, then opens http://127.0.0.1:8765
 ```
 
-Requires Python 3.10+, `ffmpeg` (`brew install ffmpeg`), and a JS runtime — deno is recommended (`brew install deno`); node or bun also work.
+```bash
+./run-mac.sh        # optional: the same app in its own Mac window, with a menu-bar icon
+run.bat             # Windows (or: powershell -ExecutionPolicy Bypass -File run.ps1), not tested yet
+```
+
+`run.sh` creates a virtual environment and updates yt-dlp on every start, because YouTube changes often. If you're offline it starts anyway. Your library lives in `data/` inside the app folder, and videos go to `~/Downloads/YT Downloader/` by default.
 
 **Mac app (optional).** `./run-mac.sh` installs pywebview and opens the downloader in its own window. Closing the window only hides it: downloads continue, the menu-bar icon (⇣ with the number of downloads) brings it back, pauses or resumes everything, opens the download folder, or quits. `scripts/make_mac_app.sh` builds `dist/YT Downloader.app`, a small launcher you can put in Applications or the Dock (keep the project folder where it is).
 
@@ -119,7 +165,10 @@ npm ci               # once: the build and test tools
 ./run.sh --dev       # the backend plus next dev at http://localhost:3000; the page reloads as you edit
 npm run build        # rebuild frontend/out, and commit it with your changes
 scripts/test.sh      # every test, offline (--fast for a quick run)
+npm run screenshots  # regenerate the README images from a made-up demo library (no internet, ~3 min)
 ```
+
+The backend is FastAPI with yt-dlp (`backend/ytdl/`: the download engine in `manager/`, the web server in `web/`). The library is SQLite. The page is Next.js, React and TypeScript. The tests are pytest, Vitest and Playwright, and they run offline against local fake servers. `CLAUDE.md` describes the architecture in detail.
 
 ## Security
 

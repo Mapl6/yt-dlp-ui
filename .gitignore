@@ -14,3 +14,4 @@ htmlcov/
 # the Next.js build cache (the built page itself, frontend/out, is committed)
 frontend/.next/
 frontend/next-env.d.ts
+.DS_Store
