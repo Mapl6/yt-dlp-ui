@@ -11,7 +11,7 @@ import pytest
 
 from ytdl import config, cookies, errors, files, settings, store, verify, ytdlp
 from ytdl import manager as M
-from helpers import wait_status
+from helpers import wait, wait_status
 
 OPTS = {"quality": "best", "container": "mp4", "thumbnail": False, "metadata": False, "numbering": False}
 BOT = Exception("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies")
@@ -301,7 +301,8 @@ def test_cross_process_lock(mgr, net, job, it, out):
     finally:
         net.level = "offline"
         holder.kill()
-    assert not list((out / config.LOCK_DIR_NAME).glob("*.lock")), "lock: lock file cleaned up"
+    # the video is "done" a moment before the download lets go of its lock (and deletes the file)
+    assert wait(lambda: not list((out / config.LOCK_DIR_NAME).glob("*.lock")), 10), "lock: lock file cleaned up"
 
 
 def test_instance_lock(mgr):

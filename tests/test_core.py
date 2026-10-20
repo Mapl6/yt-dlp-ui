@@ -90,6 +90,7 @@ def test_merge_big_list(mgr):
         del mgr.jobs[big["id"]]
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="external drives under /Volumes are a macOS thing")
 def test_queue_unplugged_drive(mgr, merged):
     # queueing to an unplugged external drive must not create folders on the system disk
     with pytest.raises(OSError) as exc:
