@@ -157,7 +157,7 @@ def test_crash_loses_nothing_saved(tmp_path, make_manager):
     script = tmp_path / "crash.py"
     script.write_text(CRASH)
     r = subprocess.run([sys.executable, str(script), str(ROOT), "4.5"], env={"YTDL_DATA_DIR": str(data),
-                       "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+                       "PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
                        **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {})}, capture_output=True, text=True, timeout=60)
     assert r.returncode == 9, r.stderr[-500:]
     m = make_manager(data)
